@@ -1,3 +1,4 @@
+git+https://github.com/neelnanda-io/TransformerLens.git
 torch
 numpy
 matplotlib
@@ -7,3 +8,7 @@ tqdm
 plotly
 ipykernel
 networkx
+fancy_einsum
+scipy
+nbformat
+scikit-learn
