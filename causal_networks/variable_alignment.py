@@ -1,3 +1,6 @@
+from functools import partial
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 
@@ -63,29 +66,37 @@ class VariableAlignment:
         self.intervene_model_hooks = intervene_model_hooks
         self.subspaces_sizes = subspaces_sizes
 
-        self._space_size = self._determine_space_size()
+        self.space_size = self._determine_space_size()
 
-        if sum(self.subspaces_sizes) > self._space_size:
+        if sum(self.subspaces_sizes) > self.space_size:
             raise ValueError(
                 f"Sum of subspace sizes ({sum(self.subspaces_sizes)}) "
-                f"exceeds activation space size ({self._space_size})"
+                f"exceeds activation space size ({self.space_size})"
             )
 
-        self.rotation = ParametrisedRotation(self._space_size)
+        self.rotation = ParametrisedRotation(self.space_size)
 
     def _determine_space_size(self) -> int:
         """Run the model to determine the size of the activation space"""
 
         print("Running model to determine activation space size...")
 
-        size = 0
+        # A singleton class to hold the size, so that it can be by the hooks
+        @dataclass
+        class Size:
+            size = 0
+        size = Size()
 
-        def counter_hook(value, hook_point: HookPoint):
-            size += value.shape[1]
+        def counter_hook(value, hook: HookPoint, size):
+            size.size += value.shape[1]
+
+        partial_counter_hook = partial(counter_hook, size=size)
 
         x = torch.zeros(1, self.hooked_model.cfg.input_size)
-        fwd_hooks = {name: counter_hook for name in self.intervene_model_hooks}
+        fwd_hooks = [
+            (name, partial_counter_hook) for name in self.intervene_model_hooks
+        ]
 
         self.hooked_model.run_with_hooks(x, fwd_hooks=fwd_hooks)
 
-        return size
+        return size.size
