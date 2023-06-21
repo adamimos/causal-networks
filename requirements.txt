@@ -1,3 +1,5 @@
+ipykernel
+ipywidgets
 git+https://github.com/neelnanda-io/TransformerLens.git
 torch
 numpy
@@ -6,7 +8,6 @@ seaborn
 pandas
 tqdm
 plotly
-ipykernel
 networkx
 fancy_einsum
 scipy
