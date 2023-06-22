@@ -10,8 +10,6 @@ from .dag import DeterministicDAG
 
 
 class ParametrisedRotation(nn.Module):
-    """A parametrised rotation matrix"""
-
     def __init__(self, size: int):
         super().__init__()
         self.size = size
@@ -19,6 +17,35 @@ class ParametrisedRotation(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.theta
+    
+
+class OrthogonalMatrix(nn.Module):
+    """
+    An n-dimensional rotation matrix is parametrized by n(n-1)/2 angles.
+    """
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+        num_parameters = n*(n-1)//2
+        self.thetas = nn.Parameter(torch.randn(num_parameters) * 0.01)
+
+    def get_rotation_matrix(self):
+        G = torch.eye(self.n, device=self.thetas.device)
+        k = 0
+        for i in range(self.n):
+            for j in range(i+1, self.n):
+                c = torch.cos(self.thetas[k])
+                s = torch.sin(self.thetas[k])
+                temp = G[i].clone()
+                G[i] = c * temp - s * G[j]
+                G[j] = s * temp + c * G[j]
+                k += 1
+        return G
+
+    def forward(self, x):
+        assert x.shape[-1] == self.n, "Input tensor last dimension must be equal to n"
+        G = self.get_rotation_matrix()
+        return torch.mm(x, G)
 
 
 class VariableAlignment:

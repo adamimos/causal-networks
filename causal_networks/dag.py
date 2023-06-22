@@ -8,6 +8,8 @@ from rich.console import Console
 
 from matplotlib import colormaps
 
+import numpy as np
+
 
 class DeterministicDAG:
     """A class for representing a deterministic DAG."""
@@ -190,6 +192,9 @@ class DeterministicDAG:
 
     def get_roots(self):
         return [node for node, degree in self.G.in_degree() if degree == 0]
+    
+    def get_leaves(self):
+        return [node for node, degree in self.G.out_degree() if degree == 0]
 
     def visualize(self, display_node_info=True, cmap_name="Pastel1"):
         cmap = colormaps[cmap_name]
@@ -227,3 +232,60 @@ class DeterministicDAG:
                 )
             console = Console()
             console.print(table)
+
+    def create_interchange_intervention_dataset(
+            self,
+            num_samples: int = 10,
+            max_source_inputs: int = 1,
+            ):
+        
+        """
+        Create a dataset for interchange intervention
+
+        The base_input is the setting of the inputs for the base run
+        The source_inputs are the settings of the inputs for the interventions
+        The gold_output is the output of the model for the interchange interventions run with the base_input
+        """
+
+        root_nodes = self.get_roots() # these are the input nodes
+        leaf_nodes = self.get_leaves() # this is the output node(s)
+
+        # the possible source nodes are those that are neither root nor leaf nodes
+        possible_source_nodes = [node for node in self.G.nodes if node not in root_nodes and node not in leaf_nodes]
+        # print(f"Possible source nodes: {possible_source_nodes}\nthere are {len(possible_source_nodes)} of them")
+
+        dataset = []
+        for i in range(num_samples):
+                        
+            # sample from the root nodes, in order to get the base input
+            base_input = {node: self.samplers[node]() for node in root_nodes}
+            num_source_inputs = np.random.randint(1, max_source_inputs+1)
+
+            # randomly choose the source input variables, these will be variables to intervene on
+            # QUESTION: should we allow for multiple interventions simultaneously? unclear from the paper
+            source_variables = np.random.choice(possible_source_nodes, num_source_inputs, replace=False)
+
+            # for each, choose a setting of the input
+            source_inputs = {
+                node: {
+                    root_node: self.samplers[root_node]() for root_node in root_nodes
+                }
+                for node in source_variables
+            }
+
+            # do the interchange intervention
+            self.do_interchange_intervention(node_lists=[[s] for s in source_variables],
+                                                          input_list=[source_inputs[s] for s in source_variables])
+            gold_output = self.run(inputs=base_input, reset=False)
+
+            # TODO: if there's more than one output this needs to change
+            gold_output = gold_output[leaf_nodes[0]] # we only care about the first leaf node
+
+            dataset.append({'base': base_input, 'source': source_inputs, 'gold': gold_output})
+
+        return dataset
+
+
+
+
+            
