@@ -288,13 +288,17 @@ class VariableAlignment:
 
         return output
 
-    def dii_training_objective(
+    def dii_training_objective_and_agreement(
         self,
         base_input: torch.Tensor,
         source_inputs: torch.Tensor,
         loss_fn: callable = F.cross_entropy,
     ):
-        """Compute the training objective for distributed interchange intervention
+        """Compute the training objective and accuracy of DII
+
+        Returns both the loss and a boolean for agreement between performing
+        distributed interchange intervention on the low-level model and
+        interchange intervention on the DAG.
 
         Parameters
         ----------
@@ -307,8 +311,11 @@ class VariableAlignment:
 
         Returns
         -------
-        torch.Tensor of shape (output_size,)
+        loss : torch.Tensor of shape (output_size,)
             The training objective
+        agreement : bool
+            Whether the low-level model and the DAG agree on the output after
+            doing interventions
         """
 
         # Run distributed interchange intervention on the high-level model
@@ -319,7 +326,7 @@ class VariableAlignment:
         # Run interchange intervention on the DAG
         output_dag = self.run_interchange_intervention(
             base_input, source_inputs
-        ).double()
+        ).float()
 
         # Assume there is only one output node. TODO
         output_dag = output_dag[0]
@@ -327,4 +334,6 @@ class VariableAlignment:
         # Compute the loss
         loss = loss_fn(output_low_level, output_dag)
 
-        return loss
+        agreement = torch.equal(output_low_level.argmax(), output_dag.argmax())
+
+        return loss, agreement
