@@ -249,8 +249,23 @@ class VariableAlignment:
         self,
         base_input: torch.Tensor,
         source_inputs: torch.Tensor,
-        output_type: str = "output_distribution",
-    ):
+    ) -> torch.Tensor:
+        """Run interchange intervention on the DAG
+
+        Parameters
+        ----------
+        base_input : torch.Tensor of shape (input_size,)
+            The base input to the model
+        source_inputs : torch.Tensor of shape (num_dag_nodes, input_size)
+            The source inputs to the model
+
+        Returns
+        -------
+        dag_output_distribution : torch.Tensor of shape (num_output_nodes,
+        num_outclasses)
+            A delta distribution over the output nodes of the DAG, after
+            running with source inputs and base input
+        """
         # Convert the inputs into things the DAG can handle
         base_input_dag = self.input_alignment(base_input)
         source_inputs_dag = self.input_alignment(source_inputs)
@@ -261,7 +276,51 @@ class VariableAlignment:
 
         # Run the patched model on the base input
         output = self.dag.run(
-            base_input_dag, reset=False, output_type=output_type, output_format="torch"
+            base_input_dag,
+            reset=False,
+            output_type="output_distribution",
+            output_format="torch",
         )
 
         return output
+
+    def dii_training_objective(
+        self,
+        base_input: torch.Tensor,
+        source_inputs: torch.Tensor,
+        loss_fn: callable = F.cross_entropy,
+    ):
+        """Compute the training objective for distributed interchange intervention
+
+        Parameters
+        ----------
+        base_input : torch.Tensor of shape (input_size,)
+            The base input to the model
+        source_inputs : torch.Tensor of shape (num_dag_nodes, input_size)
+            The source inputs to the model
+        loss_fn : callable, default=F.cross_entropy
+            The loss function to use
+
+        Returns
+        -------
+        torch.Tensor of shape (output_size,)
+            The training objective
+        """
+
+        # Run distributed interchange intervention on the high-level model
+        output_low_level = self.run_distributed_interchange_intervention(
+            base_input, source_inputs
+        )
+
+        # Run interchange intervention on the DAG
+        output_dag = self.run_interchange_intervention(
+            base_input, source_inputs
+        ).double()
+
+        # Assume there is only one output node. TODO
+        output_dag = output_dag[0]
+
+        # Compute the loss
+        loss = loss_fn(output_low_level, output_dag)
+
+        return loss
