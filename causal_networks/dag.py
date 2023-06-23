@@ -26,8 +26,10 @@ class DeterministicDAG:
         sampler: callable,
         validator: callable,
         func: Optional[callable] = None,
+        # add a subset variable, it can be anything
+        subset: Optional[callable] = None,
     ):
-        self.G.add_node(node)
+        self.G.add_node(node, subset=subset)
         self.G.nodes[node]["value"] = None
         self.G.nodes[node]["intervened"] = False
         if func is not None:
@@ -206,7 +208,7 @@ class DeterministicDAG:
                 return cmap(1)
 
         colours = list(map(get_node_colour, self.G.nodes))
-        nx.draw_kamada_kawai(self.G, with_labels=True, node_color=colours)
+        nx.draw(self.G, with_labels=True, node_color=colours, pos=nx.multipartite_layout(self.G))
         plt.show()
         if display_node_info:
             table = Table(
