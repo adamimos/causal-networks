@@ -11,19 +11,23 @@ from transformer_lens.hook_points import HookedRootModule, HookPoint
 from .dag import DeterministicDAG
 
 
-class ParametrisedRotation(nn.Module):
-    """A parametrised rotation matrix"""
+class ParametrisedOrthogonalMatrix(nn.Module):
+    """A parametrised orthogonal matrix"""
 
     def __init__(self, size: int):
         super().__init__()
         self.size = size
         self.theta = nn.Parameter(torch.randn(size, size))
 
+    def get_orthogonal_matrix(self) -> torch.Tensor:
+        Q, R = torch.linalg.qr(self.theta)
+        return Q
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.theta
+        return x @ self.get_orthogonal_matrix()
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.theta.T
+        return x @ self.get_orthogonal_matrix().T
 
 
 class VariableAlignment:
@@ -91,7 +95,7 @@ class VariableAlignment:
                 f"exceeds activation space size ({self.total_space_size})"
             )
 
-        self.rotation = ParametrisedRotation(self.total_space_size)
+        self.rotation = ParametrisedOrthogonalMatrix(self.total_space_size)
 
     def _determine_layer_sizes(self) -> list[int]:
         """Run the model to determine the sizes of the activation spaces"""
