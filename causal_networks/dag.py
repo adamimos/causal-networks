@@ -1,8 +1,12 @@
 from typing import Any, Optional
-from collections import defaultdict
+from collections import OrderedDict
+
+import torch
 
 import networkx as nx
+
 import matplotlib.pyplot as plt
+
 from rich.table import Table
 from rich.console import Console
 
@@ -24,14 +28,17 @@ class DeterministicDAG:
         sampler: callable,
         validator: callable,
         func: Optional[callable] = None,
+        possible_values: Optional[list] = None,
     ):
         self.G.add_node(node)
         self.G.nodes[node]["value"] = None
         self.G.nodes[node]["intervened"] = False
-        if func is not None:
-            self.funcs[node] = func
         self.samplers[node] = sampler
         self.validators[node] = validator
+        if func is not None:
+            self.funcs[node] = func
+        if possible_values is not None:
+            self.G.nodes[node]["possible_values"] = possible_values
 
     def add_edge(self, node1: str, node2: str):
         if node1 not in self.G or node2 not in self.G:
@@ -51,7 +58,7 @@ class DeterministicDAG:
 
     def get_value(self, node: str) -> Any:
         return self.G.nodes[node]["value"]
-    
+
     def reset_value(self, node: str):
         self.G.nodes[node]["value"] = None
 
@@ -86,11 +93,57 @@ class DeterministicDAG:
                 return self.set_value(node, None)
             return self.set_value(node, self.funcs[node](*parent_values))
 
-    def compute_all_nodes(self) -> dict[str, Any]:
-        """Compute the value of all nodes recursively"""
+    def compute_all_nodes(
+        self, output_type="all_nodes", output_format="ordereddict"
+    ) -> dict[str, Any]:
+        """Compute the value of all nodes recursively
+
+        Parameters
+        ----------
+        output_type : str
+            The type of output to return. Can be one of:
+                - "all_nodes" (default): all node values
+                - "output_nodes": only the output nodes
+                - "output_distribution": a delta distribution over the output
+                  nodes
+        output_format : str
+            The format of the output. Can be one of:
+                - "ordereddict" (default): an OrderedDict, ordered according
+                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according
+                  to `self.G.nodes`
+        """
+
         node_values = {}
         for node in nx.topological_sort(self.G):
             node_values[node] = self.compute_node(node)
+
+        if output_type == "all_nodes":
+            node_values = OrderedDict(
+                [(node, node_values[node]) for node in self.G.nodes]
+            )
+        elif output_type == "output_nodes" or output_type == "output_distribution":
+            node_values = OrderedDict(
+                [(node, node_values[node]) for node in self.get_leaves()]
+            )
+            if output_type == "output_distribution":
+                for node, value in node_values.items():
+                    if self.G.nodes[node]["possible_values"] is None:
+                        raise ValueError(
+                            f"Cannot compute output distribution for node {node} "
+                            f"because it has no set of possible values."
+                        )
+                    dist = [0 for _ in self.G.nodes[node]["possible_values"]]
+                    dist[self.G.nodes[node]["possible_values"].index(value)] = 1
+                    node_values[node] = dist
+        else:
+            raise ValueError(f"Invalid output type {output_type}")
+
+        if output_format == "ordereddict":
+            return node_values
+        elif output_format == "torch":
+            return torch.tensor(list(node_values.values()))
+
         return node_values
 
     def set_inputs(self, inputs: dict):
@@ -102,12 +155,38 @@ class DeterministicDAG:
             if not self.G.nodes[node]["intervened"]:
                 self.set_value(node, value)
 
-    def run(self, inputs: dict, reset=True) -> dict[str, Any]:
-        """Reset the model and run with inputs"""
+    def run(
+        self,
+        inputs: dict,
+        reset=True,
+        output_type="all_nodes",
+        output_format="ordereddict",
+    ) -> dict[str, Any]:
+        """Reset the model and run with inputs
+        
+        Parameters
+        ----------
+        inputs : dict
+            A dictionary mapping input nodes to their values
+        reset : bool
+            Whether to reset the model before running
+        output_type : str
+            The type of output to return. Can be one of:
+                - "all_nodes" (default): all node values
+                - "output_nodes": only the output nodes
+                - "output_distribution": a delta distribution over the output
+                  nodes
+        output_format : str
+            The format of the output. Can be one of:
+                - "ordereddict" (default): an OrderedDict, ordered according
+                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according
+                  to `self.G.nodes`
+        """
         if reset:
             self.reset()
         self.set_inputs(inputs)
-        return self.compute_all_nodes()
+        return self.compute_all_nodes(output_type=output_type, output_format=output_format)
 
     def intervene(
         self,
@@ -126,7 +205,7 @@ class DeterministicDAG:
                 f"Number of intervention nodes and values must be equal. "
                 f"Got {len(intervention_nodes)} nodes and {len(intervention_values)} values."
             )
-        
+
         # Intervene on each node, marking it as intervened and setting its value
         for node, value in zip(intervention_nodes, intervention_values):
             if not self.validators[node](value):
@@ -139,18 +218,42 @@ class DeterministicDAG:
         intervention_nodes: str | list[str],
         intervention_values: Any | list[Any],
         inputs: dict,
+        output_type="all_nodes",
+        output_format="ordereddict",
     ) -> dict[str, Any]:
-        """Reset the model, intervene and run with inputs"""
+        """Reset the model, intervene and run with inputs
+        
+        Parameters
+        ----------
+        intervention_nodes : str | list[str]
+            The node(s) to intervene on
+        intervention_values : Any | list[Any]
+            The value(s) to set the intervened node(s) to
+        inputs : dict
+            A dictionary mapping input nodes to their values
+        output_type : str
+            The type of output to return. Can be one of:
+                - "all_nodes" (default): all node values
+                - "output_nodes": only the output nodes
+                - "output_distribution": a delta distribution over the output
+                  nodes
+        output_format : str
+            The format of the output. Can be one of:
+                - "ordereddict" (default): an OrderedDict, ordered according
+                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according
+                  to `self.G.nodes`
+        """
 
         self.reset()
         self.intervene(intervention_nodes, intervention_values)
         self.set_inputs(inputs)
-        return self.compute_all_nodes()
+        return self.compute_all_nodes(output_type=output_type, output_format=output_format)
 
     def do_interchange_intervention(
         self,
         node_lists: list[list[str]],
-        input_list: list[dict[str, Any]],
+        source_input_list: list[dict[str, Any]],
     ):
         """Do interchange intervention on a list of nodes
 
@@ -176,12 +279,12 @@ class DeterministicDAG:
         # Get the values of each set of nodes on each input
         intervention_nodes = []
         intervention_values = []
-        for node_list, inputs in zip(node_lists, input_list):
+        for node_list, inputs in zip(node_lists, source_input_list):
             intervention_nodes.extend(node_list)
             node_values = self.run(inputs, reset=True)
             for node in node_list:
                 intervention_values.append(node_values[node])
-                    
+
         self.reset()
 
         # Intervene on the model, setting the value of each node to the
@@ -190,6 +293,9 @@ class DeterministicDAG:
 
     def get_roots(self):
         return [node for node, degree in self.G.in_degree() if degree == 0]
+
+    def get_leaves(self):
+        return [node for node, degree in self.G.out_degree() if degree == 0]
 
     def visualize(self, display_node_info=True, cmap_name="Pastel1"):
         cmap = colormaps[cmap_name]
