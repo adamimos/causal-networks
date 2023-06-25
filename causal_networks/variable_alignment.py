@@ -1,8 +1,12 @@
 from functools import partial
+import random
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import IterableDataset, DataLoader
+
+import numpy as np
 
 from tqdm import tqdm
 
@@ -28,6 +32,45 @@ class ParametrisedOrthogonalMatrix(nn.Module):
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.get_orthogonal_matrix().T
+
+
+class InterchangeInterventionDataset(IterableDataset):
+    """A dataset for doing interchange intervention
+
+    At each step it selects a random subset of the DAG nodes and random base
+    and source inputs. It always returns the same number of source inputs,
+    filling in for missing nodes with the base input.
+
+    Parameters
+    ----------
+    dag_nodes : list[str]
+        The names of the nodes (variables) of the DAG to be aligned
+    max_steps : int
+        The maximum number of steps to run the training for
+    """
+
+    def __init__(self, inputs: torch.Tensor, dag_nodes: list[str], num_steps: int):
+        super().__init__()
+        self.inputs = inputs
+        self.dag_nodes = dag_nodes
+        self.num_steps = num_steps
+        self.num_nodes = len(dag_nodes)
+
+    def __iter__(self):
+        for _ in range(self.num_steps):
+            node_selected_mask = torch.randint(
+                0, 2, (len(self.dag_nodes),), dtype=torch.bool
+            )
+            nodes = [
+                node
+                for node, selected in zip(self.dag_nodes, node_selected_mask)
+                if selected
+            ]
+            inputs_perm = torch.randperm(self.inputs.shape[0])
+            base_input = self.inputs[inputs_perm[0]]
+            source_inputs = self.inputs[inputs_perm[1 : self.num_nodes + 1]]
+            source_inputs[node_selected_mask] = base_input
+            yield nodes, base_input, source_inputs
 
 
 class VariableAlignment:
@@ -67,6 +110,7 @@ class VariableAlignment:
         intervene_model_hooks: str,
         subspaces_sizes: list[int],
         verbosity: int = 1,
+        progress_bar: bool = True,
     ):
         if len(dag_nodes) != len(subspaces_sizes):
             raise ValueError(
@@ -81,6 +125,7 @@ class VariableAlignment:
         self.intervene_model_hooks = intervene_model_hooks
         self.subspaces_sizes = subspaces_sizes
         self.verbosity = verbosity
+        self.progress_bar = progress_bar
 
         self.layer_sizes = self._determine_layer_sizes()
         self.total_space_size = sum(self.layer_sizes)
@@ -120,7 +165,9 @@ class VariableAlignment:
         return sizes
 
     def get_distributed_interchange_intervention_hooks(
-        self, base_input: torch.Tensor, source_inputs: torch.Tensor
+        self,
+        base_input: torch.Tensor,
+        source_inputs: torch.Tensor,
     ) -> list[tuple[str, callable]]:
         """Get hooks for distributed interchange intervention
 
@@ -131,6 +178,8 @@ class VariableAlignment:
 
         Parameters
         ----------
+        base_input : torch.Tensor of shape (input_size,) or (1, input_size)
+            The base input to the model
         source_inputs : torch.Tensor of shape (num_dag_nodes, input_size)
             The source inputs to the model
 
@@ -145,6 +194,9 @@ class VariableAlignment:
             raise ValueError(
                 f"Expected {len(self.dag_nodes)} source inputs, got {source_inputs.shape[0]}"
             )
+        
+        if base_input.ndim == 1:
+            base_input = base_input.unsqueeze(0)
 
         # Combine the base input and the source inputs
         combined_inputs = torch.cat((base_input, source_inputs), dim=0)
@@ -200,7 +252,7 @@ class VariableAlignment:
             new_activation_values,
         ):
             return new_activation_values[
-                ..., space_index : space_index + value.shape[1]
+                ..., space_index : space_index + value.shape[-1]
             ]
 
         fwd_hooks = []
@@ -337,3 +389,51 @@ class VariableAlignment:
         agreement = torch.equal(output_low_level.argmax(), output_dag.argmax())
 
         return loss, agreement
+
+    def train_rotation_matrix(
+        self, inputs: torch.Tensor, num_steps: int = 100000, lr: float = 0.01
+    ):
+        """Train the rotation matrix to align the two models
+
+        Parameters
+        ----------
+        inputs : torch.Tensor of shape (num_inputs, input_size)
+            The input on which to train the rotation matrix. Base and source
+            inputs will be samples from here
+        num_steps : int, default=100000
+            The number of steps to train the rotation matrix for
+
+        Returns
+        -------
+        losses : np.ndarray of shape (num_steps,)
+            The loss at each step
+        agreements : np.ndarray of shape (num_steps,)
+            At each step, whether the low-level model and the DAG agree on the
+            inputs
+        """
+
+        ii_dataset = InterchangeInterventionDataset(inputs, self.dag_nodes, num_steps)
+        # ii_dataloader = DataLoader(ii_dataset, batch_size=1)
+
+        optimizer = torch.optim.SGD(self.rotation.parameters(), lr=lr)
+
+        losses = np.empty(num_steps)
+        agreements = np.empty(num_steps)
+
+        iterator = enumerate(ii_dataset)
+        if self.progress_bar:
+            iterator = tqdm(iterator, total=num_steps)
+        for step, (nodes, base_input, source_inputs) in iterator:
+
+            loss, agreement = self.dii_training_objective_and_agreement(
+                base_input, source_inputs
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            losses[step] = loss.item()
+            agreements[step] = agreement
+
+        return losses, agreements
