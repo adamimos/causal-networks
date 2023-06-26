@@ -25,16 +25,18 @@ class DeterministicDAG:
     def add_node(
         self,
         node: str,
-        sampler: callable,
-        validator: callable,
+        sampler: Optional[callable] = None,
+        validator: Optional[callable] = None,
         func: Optional[callable] = None,
         possible_values: Optional[list] = None,
     ):
         self.G.add_node(node)
         self.G.nodes[node]["value"] = None
         self.G.nodes[node]["intervened"] = False
-        self.samplers[node] = sampler
-        self.validators[node] = validator
+        if sampler is not None:
+            self.samplers[node] = sampler
+        if validator is not None:
+            self.validators[node] = validator
         if func is not None:
             self.funcs[node] = func
         if possible_values is not None:
@@ -48,7 +50,7 @@ class DeterministicDAG:
         self.G.add_edge(node1, node2)
 
     def set_value(self, node: str, value) -> Any:
-        if not self.validators[node](value):
+        if node in self.validators and not self.validators[node](value):
             raise ValueError(
                 f"Invalid value {value} for node {node}. Value does not pass the validator."
             )
@@ -104,14 +106,16 @@ class DeterministicDAG:
             The type of output to return. Can be one of:
                 - "all_nodes" (default): all node values
                 - "output_nodes": only the output nodes
+                - "output_integer": the output as an integer, ranging over the
+                  possible output values
                 - "output_distribution": a delta distribution over the output
                   nodes
         output_format : str
             The format of the output. Can be one of:
                 - "ordereddict" (default): an OrderedDict, ordered according
                   to `self.G.nodes`
-                - "torch": a PyTorch tensor ordered according
-                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according to
+                  `self.G.nodes`
         """
 
         node_values = {}
@@ -122,11 +126,21 @@ class DeterministicDAG:
             node_values = OrderedDict(
                 [(node, node_values[node]) for node in self.G.nodes]
             )
-        elif output_type == "output_nodes" or output_type == "output_distribution":
+        elif output_type in ["output_nodes", "output_integer", "output_distribution"]:
             node_values = OrderedDict(
                 [(node, node_values[node]) for node in self.get_leaves()]
             )
-            if output_type == "output_distribution":
+            if output_type == "output_integer":
+                for node, value in node_values.items():
+                    if self.G.nodes[node]["possible_values"] is None:
+                        raise ValueError(
+                            f"Cannot compute output integer for node {node} "
+                            f"because it has no set of possible values."
+                        )
+                    node_values[node] = self.G.nodes[node]["possible_values"].index(
+                        value
+                    )
+            elif output_type == "output_distribution":
                 for node, value in node_values.items():
                     if self.G.nodes[node]["possible_values"] is None:
                         raise ValueError(
@@ -163,7 +177,7 @@ class DeterministicDAG:
         output_format="ordereddict",
     ) -> dict[str, Any]:
         """Reset the model and run with inputs
-        
+
         Parameters
         ----------
         inputs : dict
@@ -186,7 +200,9 @@ class DeterministicDAG:
         if reset:
             self.reset()
         self.set_inputs(inputs)
-        return self.compute_all_nodes(output_type=output_type, output_format=output_format)
+        return self.compute_all_nodes(
+            output_type=output_type, output_format=output_format
+        )
 
     def intervene(
         self,
@@ -222,7 +238,7 @@ class DeterministicDAG:
         output_format="ordereddict",
     ) -> dict[str, Any]:
         """Reset the model, intervene and run with inputs
-        
+
         Parameters
         ----------
         intervention_nodes : str | list[str]
@@ -248,7 +264,9 @@ class DeterministicDAG:
         self.reset()
         self.intervene(intervention_nodes, intervention_values)
         self.set_inputs(inputs)
-        return self.compute_all_nodes(output_type=output_type, output_format=output_format)
+        return self.compute_all_nodes(
+            output_type=output_type, output_format=output_format
+        )
 
     def do_interchange_intervention(
         self,
@@ -320,6 +338,8 @@ class DeterministicDAG:
             table.add_column("Value")
             for node in self.G.nodes:
                 func_name = self.funcs[node].__name__ if node in self.funcs else "-"
+                sampler_name = self.samplers[node].__name__ if node in self.samplers else "-"
+                validator_name = self.validators[node].__name__ if node in self.validators else "-"
                 if self.G.nodes[node]["value"] is not None:
                     value_str = str(self.G.nodes[node]["value"])
                 else:
@@ -327,9 +347,242 @@ class DeterministicDAG:
                 table.add_row(
                     node,
                     func_name,
-                    self.samplers[node].__name__,
-                    self.validators[node].__name__,
+                    sampler_name,
+                    validator_name,
                     value_str,
+                )
+            console = Console()
+            console.print(table)
+
+
+class RecurrentDeterministicDAG(DeterministicDAG):
+    """A deterministic DAG with recurrent connections"""
+
+    def __init__(self, num_streams: int = 1):
+        self._num_streams = num_streams
+
+        self.G = nx.DiGraph()
+        self.funcs = {}
+        self.validators = {}
+        self.samplers = {}
+
+    @property
+    def num_streams(self):
+        return self._num_streams
+
+    @num_streams.setter
+    def num_streams(self, new_num_streams):
+        if new_num_streams < 1:
+            raise ValueError("num_streams must be at least 1")
+        diff = new_num_streams - self._num_streams
+        for node in self.G.nodes:
+            if diff > 0:
+                self.G.nodes[node]["value"].extend([None for _ in range(diff)])
+                self.G.nodes[node]["intervened"].extend([False for _ in range(diff)])
+            elif diff < 0:
+                self.G.nodes[node]["value"] = self.G.nodes[node]["value"][
+                    :new_num_streams
+                ]
+                self.G.nodes[node]["intervened"] = self.G.nodes[node]["intervened"][
+                    :new_num_streams
+                ]
+        self._num_streams = new_num_streams
+
+    def add_node(
+        self,
+        node: str,
+        sampler: Optional[callable] = None,
+        validator: Optional[callable] = None,
+        func: Optional[callable] = None,
+        possible_values: Optional[list] = None,
+    ):
+        super().add_node(node, sampler, validator, func, possible_values)
+        self.G.nodes[node]["value"] = [None for _ in range(self._num_streams)]
+        self.G.nodes[node]["intervened"] = [False for _ in range(self._num_streams)]
+
+    def add_edge(self, node1: str, node2: str, edge_type: str = "current_stream"):
+        """Add an edge between two nodes
+
+        Parameters
+        ----------
+        node1 : str
+            The first node
+        node2 : str
+            The second node
+        edge_type : str, default "current_stream"
+            The type of edge to add. Can be one of:
+                - "current_stream" (default): the edge exists only locally,
+                  per stream
+                - "all_streams": the edge exists globally, connecting the
+                  first node to the instances of the second node in all
+                  streams
+                - "current_and_previous_streams": the edge exists globally,
+                  connecting the first node to the instances of the second
+                  node in the current and previous streams
+        """
+        if node1 not in self.G or node2 not in self.G:
+            raise ValueError(
+                f"Nodes must exist before an edge can be created between them."
+            )
+        if edge_type not in [
+            "current_stream",
+            "all_streams",
+            "current_and_previous_streams",
+        ]:
+            raise ValueError(
+                f"Edge type must be one of 'current_stream', 'all_streams', "
+                f"or 'current_and_previous_streams', got '{edge_type}'"
+            )
+        self.G.add_edge(node1, node2, edge_type=edge_type)
+
+    def set_value(self, node: str, value, stream: Optional[int] = None) -> Any:
+        """Set the value of a node
+
+        Parameters
+        ----------
+        node : str
+            The node to set the value of
+        value : Any
+            The value to set the node to
+        stream : Optional[int]
+            The stream to set the value of. If None, the value is set for all
+            streams.
+        """
+        if node in self.validators and not self.validators[node](value):
+            raise ValueError(
+                f"Invalid value {value} for node {node}. Value does not pass the validator."
+            )
+        if stream is None:
+            self.G.nodes[node]["value"] = [value for _ in range(self._num_streams)]
+        else:
+            self.G.nodes[node]["value"][stream] = value
+        self.G.nodes[node]["intervened"] = [False for _ in range(self._num_streams)]
+        return value
+
+    def get_value(self, node: str, stream: Optional[int] = None) -> Any:
+        if stream is None:
+            return self.G.nodes[node]["value"]
+        else:
+            return self.G.nodes[node]["value"][stream]
+
+    def reset_value(self, node: str, stream: Optional[int] = None):
+        if stream is None:
+            self.G.nodes[node]["value"] = [None for _ in range(self._num_streams)]
+        else:
+            self.G.nodes[node]["value"][stream] = None
+
+    def reset_interventions(self):
+        for node in self.G.nodes:
+            self.G.nodes[node]["intervened"] = [False for _ in range(self._num_streams)]
+
+    def compute_node(self, node: str, stream: Optional[int] = None) -> Any:
+        """Compute the value of a single node"""
+
+        if stream is None:
+            streams = range(self._num_streams)
+        else:
+            streams = [stream]
+
+        for curr_stream in streams:
+            # Do not recalculate the value of a node that has been intervened on
+            if self.G.nodes[node]["intervened"][curr_stream]:
+                continue
+
+            # If the node doesn't have a function, just return its value
+            if node not in self.funcs:
+                continue
+
+            # If the node has a function, compute its value from its parents
+            parents = list(self.G.predecessors(node))
+            if len(parents) > 0:
+                args = {}
+                for parent in parents:
+                    if self.G[parent][node]["edge_type"] == "current_stream":
+                        args[parent] = self.G.nodes[parent]["value"][curr_stream]
+                    elif self.G[parent][node]["edge_type"] == "all_streams":
+                        args[parent] = self.G.nodes[parent]["value"]
+                    elif (
+                        self.G[parent][node]["edge_type"]
+                        == "current_and_previous_streams"
+                    ):
+                        args[parent] = self.G.nodes[parent]["value"][: curr_stream + 1]
+                self.G.nodes[node]["value"][curr_stream] = self.funcs[node](**args)
+            else:
+                self.G.nodes[node]["value"][curr_stream] = self.funcs[node]()
+
+        if stream is None:
+            return self.G.nodes[node]["value"]
+        else:
+            return self.G.nodes[node]["value"][stream]
+
+    def create_full_graph(self):
+        full_graph = nx.DiGraph()
+        for node in self.G.nodes:
+            for stream in range(self._num_streams):
+                full_graph.add_node(
+                    f"{node}:{stream}",
+                    original_node=node,
+                    stream=stream,
+                    value=self.G.nodes[node]["value"][stream],
+                    intervened=self.G.nodes[node]["intervened"][stream],
+                )
+        for node1, node2 in self.G.edges:
+            if self.G[node1][node2]["edge_type"] == "current_stream":
+                for stream in range(self._num_streams):
+                    full_graph.add_edge(f"{node1}:{stream}", f"{node2}:{stream}")
+            elif self.G[node1][node2]["edge_type"] == "all_streams":
+                for stream1 in range(self._num_streams):
+                    for stream2 in range(self._num_streams):
+                        full_graph.add_edge(f"{node1}:{stream1}", f"{node2}:{stream2}")
+            elif self.G[node1][node2]["edge_type"] == "current_and_previous_streams":
+                for stream2 in range(self._num_streams):
+                    for stream1 in range(stream2 + 1):
+                        full_graph.add_edge(f"{node1}:{stream1}", f"{node2}:{stream2}")
+        return full_graph
+
+    def visualize(self, display_node_info=True, cmap_name="Pastel1"):
+        cmap = colormaps[cmap_name]
+
+        full_graph = self.create_full_graph()
+
+        def get_node_colour(node, full_graph):
+            if full_graph.nodes[node]["intervened"]:
+                return cmap(0)
+            else:
+                return cmap(1)
+
+        colours = [get_node_colour(node, full_graph) for node in full_graph.nodes]
+
+        nx.draw(
+            full_graph,
+            with_labels=True,
+            node_color=colours,
+            pos=nx.multipartite_layout(full_graph, subset_key="stream"),
+        )
+
+        plt.show()
+        if display_node_info:
+            table = Table(
+                title="Node Information", show_header=True, header_style="bold"
+            )
+            table.add_column("Node")
+            table.add_column("Function")
+            for stream in range(self._num_streams):
+                table.add_column(f"Value {stream}")
+            for node in self.G.nodes:
+                func_name = self.funcs[node].__name__ if node in self.funcs else "-"
+                sampler_name = self.samplers[node].__name__ if node in self.samplers else "-"
+                validator_name = self.validators[node].__name__ if node in self.validators else "-"
+                value_strs = []
+                for stream in range(self._num_streams):
+                    if self.G.nodes[node]["value"][stream] is not None:
+                        value_strs.append(str(self.G.nodes[node]["value"][stream]))
+                    else:
+                        value_strs.append("-")
+                table.add_row(
+                    node,
+                    func_name,
+                    *value_strs,
                 )
             console = Console()
             console.print(table)
