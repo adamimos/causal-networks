@@ -276,8 +276,8 @@ class DeterministicDAG:
         """Do interchange intervention on a list of nodes
 
         Computes the value of each node in `node_lists` on each input in
-        `input_list`, and intervenes on the model, setting the value of those
-        nodes to the computed value.
+        `source_input_list`, and intervenes on the model, setting the value of
+        those nodes to the computed value.
 
         Note that this function first resets the model.
         """
