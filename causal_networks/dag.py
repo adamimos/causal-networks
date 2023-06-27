@@ -76,6 +76,12 @@ class DeterministicDAG:
         self.reset_all_values()
         self.reset_interventions()
 
+    def get_roots(self):
+        return [node for node, degree in self.G.in_degree() if degree == 0]
+
+    def get_leaves(self):
+        return [node for node, degree in self.G.out_degree() if degree == 0]
+
     def compute_node(self, node: str) -> Any:
         """Compute the value of a single node"""
 
@@ -309,12 +315,6 @@ class DeterministicDAG:
         # computed value under its respective input
         self.intervene(intervention_nodes, intervention_values)
 
-    def get_roots(self):
-        return [node for node, degree in self.G.in_degree() if degree == 0]
-
-    def get_leaves(self):
-        return [node for node, degree in self.G.out_degree() if degree == 0]
-
     def visualize(self, display_node_info=True, cmap_name="Pastel1"):
         cmap = colormaps[cmap_name]
 
@@ -338,8 +338,12 @@ class DeterministicDAG:
             table.add_column("Value")
             for node in self.G.nodes:
                 func_name = self.funcs[node].__name__ if node in self.funcs else "-"
-                sampler_name = self.samplers[node].__name__ if node in self.samplers else "-"
-                validator_name = self.validators[node].__name__ if node in self.validators else "-"
+                sampler_name = (
+                    self.samplers[node].__name__ if node in self.samplers else "-"
+                )
+                validator_name = (
+                    self.validators[node].__name__ if node in self.validators else "-"
+                )
                 if self.G.nodes[node]["value"] is not None:
                     value_str = str(self.G.nodes[node]["value"])
                 else:
@@ -459,6 +463,31 @@ class RecurrentDeterministicDAG(DeterministicDAG):
         self.G.nodes[node]["intervened"] = [False for _ in range(self._num_streams)]
         return value
 
+    def set_value_across_streams(
+        self, node: str, values: list, exclude_intervened=True
+    ) -> Any:
+        """Set the value of a node according to a list of stream values
+
+        Parameters
+        ----------
+        node : str
+            The node to set the value of
+        value : list
+            The values to set the node to, one for each stream
+        exclude_intervened : bool, default=True
+            If True, only set the value for streams that have not been intervened on
+        """
+        for stream, value in enumerate(values):
+            if exclude_intervened and self.G.nodes[node]["intervened"][stream]:
+                continue
+            if node in self.validators and not self.validators[node](value):
+                raise ValueError(
+                    f"Invalid value {value} for node {node}. Value does not pass the validator."
+                )
+            self.G.nodes[node]["value"][stream] = value
+            self.G.nodes[node]["intervened"][stream] = False
+        return self.G.nodes[node]["value"]
+
     def get_value(self, node: str, stream: Optional[int] = None) -> Any:
         if stream is None:
             return self.G.nodes[node]["value"]
@@ -514,6 +543,265 @@ class RecurrentDeterministicDAG(DeterministicDAG):
             return self.G.nodes[node]["value"]
         else:
             return self.G.nodes[node]["value"][stream]
+
+    def compute_all_nodes(
+        self, output_type="all_nodes", output_format="ordereddict"
+    ) -> dict[str, Any]:
+        """Compute the value of all nodes recursively
+
+        Parameters
+        ----------
+        output_type : str
+            The type of output to return. Can be one of:
+                - "all_nodes" (default): all node values
+                - "output_nodes": only the output nodes
+                - "output_integer": the output as an integer, ranging over the
+                  possible output values
+                - "output_distribution": a delta distribution over the output
+                  nodes
+        output_format : str
+            The format of the output. Can be one of:
+                - "ordereddict" (default): an OrderedDict, ordered according
+                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according to
+                  `self.G.nodes`
+        """
+
+        node_values = super().compute_all_nodes(
+            output_type="all_nodes", output_format="ordereddict"
+        )
+
+        if output_type in ["output_nodes", "output_integer", "output_distribution"]:
+            node_values = OrderedDict(
+                [(node, node_values[node]) for node in self.get_leaves()]
+            )
+            if output_type == "output_integer":
+                for node, values in node_values.items():
+                    if self.G.nodes[node]["possible_values"] is None:
+                        raise ValueError(
+                            f"Cannot compute output integer for node {node} "
+                            f"because it has no set of possible values."
+                        )
+                    node_values[node] = []
+                    for value in values:
+                        node_values[node].append(
+                            self.G.nodes[node]["possible_values"].index(value)
+                        )
+            elif output_type == "output_distribution":
+                for node, values in node_values.items():
+                    if self.G.nodes[node]["possible_values"] is None:
+                        raise ValueError(
+                            f"Cannot compute output distribution for node {node} "
+                            f"because it has no set of possible values."
+                        )
+                    node_values[node] = []
+                    for value in values:
+                        dist = [0 for _ in self.G.nodes[node]["possible_values"]]
+                        dist[self.G.nodes[node]["possible_values"].index(value)] = 1
+                        node_values[node].append(dist)
+        elif output_type != "all_nodes":
+            raise ValueError(f"Invalid output type {output_type}")
+
+        if output_format == "ordereddict":
+            return node_values
+        elif output_format == "torch":
+            return torch.tensor(list(node_values.values()))
+
+        return node_values
+
+    def set_inputs(self, inputs: dict[str, list]):
+        """Set the values of non-intervened input nodes across streams"""
+        input_nodes = self.get_roots()
+        for node, values in inputs.items():
+            if node not in input_nodes:
+                raise ValueError(f"Node {node} is not an input node.")
+            self.set_value_across_streams(node, values)
+
+    def run(
+        self,
+        inputs: dict[str, list[Any]],
+        reset=True,
+        output_type="all_nodes",
+        output_format="ordereddict",
+    ) -> dict[str, Any]:
+        """Reset the model and run with inputs
+
+        Parameters
+        ----------
+        inputs : dict[str, list[Any]]
+            A dictionary mapping input nodes to their list of values (one for
+            each stream).
+        reset : bool
+            Whether to reset the model before running
+        output_type : str
+            The type of output to return. Can be one of:
+                - "all_nodes" (default): all node values
+                - "output_nodes": only the output nodes
+                - "output_distribution": a delta distribution over the output
+                  nodes
+        output_format : str
+            The format of the output. Can be one of:
+                - "ordereddict" (default): an OrderedDict, ordered according
+                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according to
+                  `self.G.nodes`
+        """
+        for node, values in inputs.items():
+            if not isinstance(values, list) or len(values) != self._num_streams:
+                raise ValueError(
+                    f"Input values for node {node} must be a list of length {self._num_streams}"
+                )
+        return super().run(
+            inputs, reset=reset, output_type=output_type, output_format=output_format
+        )
+
+    def intervene(
+        self,
+        intervention_nodes_streams: str | tuple[str, int] | list[str | tuple[str, int]],
+        intervention_values: Any | list,
+    ):
+        """Intervene on a list of nodes at specific streams"""
+
+        if not isinstance(intervention_nodes_streams, list):
+            intervention_nodes_streams = [intervention_nodes_streams]
+        if not isinstance(intervention_values, list):
+            intervention_values = [intervention_values] * len(
+                intervention_nodes_streams
+            )
+
+        if len(intervention_nodes_streams) != len(intervention_values):
+            raise ValueError(
+                f"Number of intervention nodes and values must be equal. "
+                f"Got {len(intervention_nodes_streams)} nodes and {len(intervention_values)} values."
+            )
+
+        # Intervene on each node, marking it as intervened and setting its value
+        for item, value in zip(intervention_nodes_streams, intervention_values):
+            if isinstance(item, str):
+                for val in value:
+                    if node in self.validators and not self.validators[node](val):
+                        raise ValueError(f"Invalid value {val} for node {node}")
+                if len(value) != self._num_streams:
+                    raise ValueError(
+                        f"Intervention value for node {item} must be a "
+                        f"list of length {self._num_streams}"
+                    )
+                self.G.nodes[item]["value"] = value
+                self.G.nodes[item]["intervened"] = [
+                    True for _ in range(self._num_streams)
+                ]
+            elif isinstance(item, tuple):
+                node, stream = item
+                if node in self.validators and not self.validators[node](value):
+                    raise ValueError(f"Invalid value {value} for node {node}")
+                self.G.nodes[node]["value"][stream] = value
+                self.G.nodes[node]["intervened"][stream] = True
+            else:
+                raise ValueError(
+                    f"Invalid intervention node {item}. Must be a string or a tuple."
+                )
+
+    def intervene_and_run(
+        self,
+        intervention_nodes_streams: str | tuple[str, int] | list[str | tuple[str, int]],
+        intervention_values: Any | list[Any],
+        inputs: dict,
+        output_type="all_nodes",
+        output_format="ordereddict",
+    ) -> dict[str, Any]:
+        """Reset the model, intervene and run with inputs
+
+        Parameters
+        ----------
+        intervention_nodes : str | tuple[str, int] | list[str | tuple[str,
+        int]]
+            The nodes and stream positions to intervene on. Nodes can be
+            specified either as strings or as tuples of the form (node,
+            stream). In the former case, the corresponding value must be a
+            list of values, one for each stream.
+        intervention_values : Any | list[Any]
+            The values to set the intervened nodes to
+        inputs : dict
+            A dictionary mapping input nodes to their values
+        output_type : str
+            The type of output to return. Can be one of:
+                - "all_nodes" (default): all node values
+                - "output_nodes": only the output nodes
+                - "output_distribution": a delta distribution over the output
+                  nodes
+        output_format : str
+            The format of the output. Can be one of:
+                - "ordereddict" (default): an OrderedDict, ordered according
+                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according to
+                  `self.G.nodes`
+        """
+        super().intervene_and_run(
+            intervention_nodes=intervention_nodes_streams,
+            intervention_values=intervention_values,
+            inputs=inputs,
+            output_type=output_type,
+            output_format=output_format,
+        )
+
+    def do_interchange_intervention(
+        self,
+        node_lists: list[list[str | tuple[str, int]]],
+        source_input_list: list[dict[str, Any]],
+    ):
+        """Do interchange intervention on a list of nodes
+
+        Computes the value of each node and stream in `node_lists` on each input in
+        `source_input_list`, and intervenes on the model, setting the value of
+        those nodes to the computed value.
+
+        Note that this function first resets the model.
+        """
+
+        # Replace all single nodes with tuples of the form (node, stream), one
+        # for each stream
+        new_node_lists = []
+        for i in range(len(node_lists)):
+            new_node_list = []
+            for j in range(len(node_lists[i])):
+                if isinstance(node_lists[i][j], str):
+                    new_node_list.extend(
+                        [(node_lists[i][j], stream) for stream in range(self._num_streams)]
+                    )
+                elif isinstance(node_lists[i][j], tuple):
+                    new_node_list.append(node_lists[i][j])
+                else:
+                    raise ValueError(
+                        f"Invalid node {node_lists[i][j]}. Must be a string or a tuple."
+                    )
+            new_node_lists.append(new_node_list)
+        node_lists = new_node_lists
+
+        # Make sure `node_lists` is a list of disjoint lists
+        for i in range(len(node_lists)):
+            for j in range(len(node_lists)):
+                if i == j:
+                    continue
+                for node in node_lists[i]:
+                    if node in node_lists[j]:
+                        raise ValueError(
+                            f"Expected `intervention_node_lists` to be a list of disjoint lists"
+                        )
+
+        # Get the values of each set of nodes on each input
+        intervention_nodes = []
+        intervention_values = []
+        for node_list, inputs in zip(node_lists, source_input_list):
+            node_values = self.run(inputs, reset=True)
+            for node, stream in node_list:
+                intervention_nodes.append((node, stream))
+                intervention_values.append(node_values[node][stream])
+
+        self.reset()
+
+        # Intervene on the model, setting the value of each node to the
+        # computed value under its respective input
+        self.intervene(intervention_nodes, intervention_values)
 
     def create_full_graph(self):
         full_graph = nx.DiGraph()
@@ -571,8 +859,12 @@ class RecurrentDeterministicDAG(DeterministicDAG):
                 table.add_column(f"Value {stream}")
             for node in self.G.nodes:
                 func_name = self.funcs[node].__name__ if node in self.funcs else "-"
-                sampler_name = self.samplers[node].__name__ if node in self.samplers else "-"
-                validator_name = self.validators[node].__name__ if node in self.validators else "-"
+                sampler_name = (
+                    self.samplers[node].__name__ if node in self.samplers else "-"
+                )
+                validator_name = (
+                    self.validators[node].__name__ if node in self.validators else "-"
+                )
                 value_strs = []
                 for stream in range(self._num_streams):
                     if self.G.nodes[node]["value"][stream] is not None:
