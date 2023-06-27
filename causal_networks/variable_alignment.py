@@ -518,23 +518,12 @@ class VariableAlignment:
             base_input, source_inputs
         )
 
-        # output_low_level_per = torch.zeros_like(output_low_level)
-        # for i in range(batch_size):
-        #     output_low_level_per[i] = self.run_distributed_interchange_intervention(
-        #         base_input[i], source_inputs[i]
-        #     )
-
-        # if not torch.allclose(output_low_level, output_low_level_per):
-        #     print(output_low_level)
-        #     print(output_low_level_per)
-        #     assert False
-
         # Run interchange intervention on the DAG
         if gold_outputs is None:
             gold_outputs = []
-            for _ in range(batch_size):
+            for i in range(batch_size):
                 gold_output = self.run_interchange_intervention(
-                    base_input, source_inputs, output_type="output_integer"
+                    base_input[i], source_inputs[i], output_type="output_integer"
                 )
                 # Assume there is only one output node. TODO
                 gold_output = gold_output[0].to(self.device)
