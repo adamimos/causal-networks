@@ -136,3 +136,5 @@ dmypy.json
 
 # Swp files
 *.swp
+
+playground/saved_data
