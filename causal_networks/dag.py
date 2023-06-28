@@ -749,7 +749,7 @@ class RecurrentDeterministicDAG(DeterministicDAG):
         node_lists: list[list[str | tuple[str, int]]],
         source_input_list: list[dict[str, Any]],
     ):
-        """Do interchange intervention on a list of nodes
+        """Do interchange intervention on a list of nodes or node-stream tuples
 
         Computes the value of each node and stream in `node_lists` on each input in
         `source_input_list`, and intervenes on the model, setting the value of
