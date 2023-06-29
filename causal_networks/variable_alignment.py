@@ -1045,6 +1045,8 @@ class VariableAlignmentTransformer(VariableAlignment):
     ) -> torch.Tensor:
         """Run interchange intervention on the DAG
 
+        Uses the vectorised runner if available.
+
         Parameters
         ----------
         base_input : torch.Tensor of shape (seq_len, )
@@ -1066,17 +1068,29 @@ class VariableAlignmentTransformer(VariableAlignment):
         # (num_dag_nodes * seq_len, seq_len)
         source_inputs = source_inputs.view(-1, seq_len)
 
+        vectorised = self.dag.vectorised_runner is not None
+
         # Convert the inputs into things the DAG can handle
         base_input_dag = self.input_alignment(base_input)
-        source_inputs_dag = self.input_alignment(source_inputs)
-        dag_node_singletons = [
-            [(dag_node, stream)]
-            for dag_node in self.dag_nodes
-            for stream in range(seq_len)
-        ]
+        source_inputs_dag = self.input_alignment(source_inputs, vectorised=vectorised)
 
         # Run the intervention to create a patched model
-        self.dag.do_interchange_intervention(dag_node_singletons, source_inputs_dag)
+        if vectorised:
+            node_stream_list = [
+                (dag_node, stream)
+                for dag_node in self.dag_nodes
+                for stream in range(seq_len)
+            ]
+            self.dag.do_interchange_intervention_vectorised_single_node_streams(
+                node_stream_list, source_inputs_dag
+            )
+        else:
+            dag_node_singletons = [
+                [(dag_node, stream)]
+                for dag_node in self.dag_nodes
+                for stream in range(seq_len)
+            ]
+            self.dag.do_interchange_intervention(dag_node_singletons, source_inputs_dag)
 
         # Run the patched model on the base input
         output = self.dag.run(

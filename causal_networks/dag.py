@@ -1,7 +1,10 @@
 from typing import Any, Optional
 from collections import OrderedDict
+import itertools
 
 import torch
+
+import numpy as np
 
 import networkx as nx
 
@@ -101,33 +104,12 @@ class DeterministicDAG:
                 return self.set_value(node, None)
             return self.set_value(node, self.funcs[node](*parent_values))
 
-    def compute_all_nodes(
-        self, output_type="all_nodes", output_format="ordereddict"
-    ) -> dict[str, Any]:
-        """Compute the value of all nodes recursively
-
-        Parameters
-        ----------
-        output_type : str
-            The type of output to return. Can be one of:
-                - "all_nodes" (default): all node values
-                - "output_nodes": only the output nodes
-                - "output_integer": the output as an integer, ranging over the
-                  possible output values
-                - "output_distribution": a delta distribution over the output
-                  nodes
-        output_format : str
-            The format of the output. Can be one of:
-                - "ordereddict" (default): an OrderedDict, ordered according
-                  to `self.G.nodes`
-                - "torch": a PyTorch tensor ordered according to
-                  `self.G.nodes`
-        """
-
-        node_values = {}
-        for node in nx.topological_sort(self.G):
-            node_values[node] = self.compute_node(node)
-
+    def _format_output(
+        self,
+        node_values: dict[str, Any],
+        output_type="all_nodes",
+        output_format="ordereddict",
+    ):
         if output_type == "all_nodes":
             node_values = OrderedDict(
                 [(node, node_values[node]) for node in self.G.nodes]
@@ -163,8 +145,37 @@ class DeterministicDAG:
             return node_values
         elif output_format == "torch":
             return torch.tensor(list(node_values.values()))
+        else:
+            raise ValueError(f"Invalid output format {output_format}")
 
-        return node_values
+    def compute_all_nodes(
+        self, output_type="all_nodes", output_format="ordereddict"
+    ) -> dict[str, Any]:
+        """Compute the value of all nodes recursively
+
+        Parameters
+        ----------
+        output_type : str
+            The type of output to return. Can be one of:
+                - "all_nodes" (default): all node values
+                - "output_nodes": only the output nodes
+                - "output_integer": the output as an integer, ranging over the
+                  possible output values
+                - "output_distribution": a delta distribution over the output
+                  nodes
+        output_format : str
+            The format of the output. Can be one of:
+                - "ordereddict" (default): an OrderedDict, ordered according
+                  to `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according to
+                  `self.G.nodes`
+        """
+
+        node_values = {}
+        for node in nx.topological_sort(self.G):
+            node_values[node] = self.compute_node(node)
+
+        return self._format_output(node_values, output_type, output_format)
 
     def set_inputs(self, inputs: dict):
         """Set the values of non-intervened input nodes"""
@@ -370,6 +381,8 @@ class RecurrentDeterministicDAG(DeterministicDAG):
         self.validators = {}
         self.samplers = {}
 
+        self.vectorised_runner: Optional[callable] = None
+
     @property
     def num_streams(self):
         return self._num_streams
@@ -544,33 +557,12 @@ class RecurrentDeterministicDAG(DeterministicDAG):
         else:
             return self.G.nodes[node]["value"][stream]
 
-    def compute_all_nodes(
-        self, output_type="all_nodes", output_format="ordereddict"
-    ) -> dict[str, Any]:
-        """Compute the value of all nodes recursively
-
-        Parameters
-        ----------
-        output_type : str
-            The type of output to return. Can be one of:
-                - "all_nodes" (default): all node values
-                - "output_nodes": only the output nodes
-                - "output_integer": the output as an integer, ranging over the
-                  possible output values
-                - "output_distribution": a delta distribution over the output
-                  nodes
-        output_format : str
-            The format of the output. Can be one of:
-                - "ordereddict" (default): an OrderedDict, ordered according
-                  to `self.G.nodes`
-                - "torch": a PyTorch tensor ordered according to
-                  `self.G.nodes`
-        """
-
-        node_values = super().compute_all_nodes(
-            output_type="all_nodes", output_format="ordereddict"
-        )
-
+    def _format_output(
+        self,
+        node_values: dict[str, Any],
+        output_type="all_nodes",
+        output_format="ordereddict",
+    ):
         if output_type in ["output_nodes", "output_integer", "output_distribution"]:
             node_values = OrderedDict(
                 [(node, node_values[node]) for node in self.get_leaves()]
@@ -606,8 +598,8 @@ class RecurrentDeterministicDAG(DeterministicDAG):
             return node_values
         elif output_format == "torch":
             return torch.tensor(list(node_values.values()))
-
-        return node_values
+        else:
+            raise ValueError(f"Invalid output format {output_format}")
 
     def set_inputs(self, inputs: dict[str, list]):
         """Set the values of non-intervened input nodes across streams"""
@@ -619,8 +611,9 @@ class RecurrentDeterministicDAG(DeterministicDAG):
 
     def run(
         self,
-        inputs: dict[str, list[Any]],
+        inputs: dict[str, list[Any]] | dict[str, np.ndarray],
         reset=True,
+        vectorised=False,
         output_type="all_nodes",
         output_format="ordereddict",
     ) -> dict[str, Any]:
@@ -628,32 +621,49 @@ class RecurrentDeterministicDAG(DeterministicDAG):
 
         Parameters
         ----------
-        inputs : dict[str, list[Any]]
-            A dictionary mapping input nodes to their list of values (one for
-            each stream).
-        reset : bool
+        inputs : dict[str, list[Any]] | dict[str, np.ndarray]
+            A dictionary mapping input nodes to their list of values (one for each
+            stream). If run in vectorised mode, the values can be batched numpy arrays.
+        reset : bool, default=True
             Whether to reset the model before running
+        vectorised : bool, default=False
+            Whether to run the model using the vectorised runner
         output_type : str
             The type of output to return. Can be one of:
                 - "all_nodes" (default): all node values
                 - "output_nodes": only the output nodes
-                - "output_distribution": a delta distribution over the output
-                  nodes
+                - "output_distribution": a delta distribution over the output nodes
         output_format : str
             The format of the output. Can be one of:
-                - "ordereddict" (default): an OrderedDict, ordered according
-                  to `self.G.nodes`
-                - "torch": a PyTorch tensor ordered according to
+                - "ordereddict" (default): an OrderedDict, ordered according to
                   `self.G.nodes`
+                - "torch": a PyTorch tensor ordered according to `self.G.nodes`
         """
-        for node, values in inputs.items():
-            if not isinstance(values, list) or len(values) != self._num_streams:
+
+        if vectorised:
+            if self.vectorised_runner is None:
                 raise ValueError(
-                    f"Input values for node {node} must be a list of length {self._num_streams}"
+                    "Cannot run model in vectorised mode because no vectorised runner "
+                    "has been set."
                 )
-        return super().run(
-            inputs, reset=reset, output_type=output_type, output_format=output_format
-        )
+            if reset:
+                self.reset()
+            return self.vectorised_runner(
+                inputs, output_type=output_type, output_format=output_format
+            )
+        else:
+            for node, values in inputs.items():
+                if not isinstance(values, list) or len(values) != self._num_streams:
+                    raise ValueError(
+                        f"Input values for node {node} must be a list of length "
+                        f"{self._num_streams}"
+                    )
+            return super().run(
+                inputs,
+                reset=reset,
+                output_type=output_type,
+                output_format=output_format,
+            )
 
     def intervene(
         self,
@@ -748,6 +758,7 @@ class RecurrentDeterministicDAG(DeterministicDAG):
         self,
         node_lists: list[list[str | tuple[str, int]]],
         source_input_list: list[dict[str, Any]],
+        vectorised: bool = False,
     ):
         """Do interchange intervention on a list of nodes or node-stream tuples
 
@@ -766,7 +777,10 @@ class RecurrentDeterministicDAG(DeterministicDAG):
             for j in range(len(node_lists[i])):
                 if isinstance(node_lists[i][j], str):
                     new_node_list.extend(
-                        [(node_lists[i][j], stream) for stream in range(self._num_streams)]
+                        [
+                            (node_lists[i][j], stream)
+                            for stream in range(self._num_streams)
+                        ]
                     )
                 elif isinstance(node_lists[i][j], tuple):
                     new_node_list.append(node_lists[i][j])
@@ -785,7 +799,8 @@ class RecurrentDeterministicDAG(DeterministicDAG):
                 for node in node_lists[i]:
                     if node in node_lists[j]:
                         raise ValueError(
-                            f"Expected `intervention_node_lists` to be a list of disjoint lists"
+                            "Expected `intervention_node_lists` to be a list of "
+                            "disjoint lists"
                         )
 
         # Get the values of each set of nodes on each input
@@ -802,6 +817,35 @@ class RecurrentDeterministicDAG(DeterministicDAG):
         # Intervene on the model, setting the value of each node to the
         # computed value under its respective input
         self.intervene(intervention_nodes, intervention_values)
+
+    def do_interchange_intervention_vectorised_single_node_streams(
+        self, node_stream_list: list[tuple[str, int]], source_inputs: dict[str, Any]
+    ):
+        """Do interchange intervention using the vectorised runner for singletons
+        
+        Parameters
+        ----------
+        node_stream_list : list[tuple[str, int]]
+            A list of node-stream tuples to intervene on
+        source_inputs : dict[str, Any]
+            A dictionary mapping input nodes to their values, which should be lists or
+            arrays of shape (len(node_stream_list), num_streams)
+        """
+
+        for node, value in source_inputs.items():
+            source_inputs[node] = np.array(value)
+            if source_inputs[node].ndim == 1:
+                source_inputs[node] = np.expand_dims(source_inputs[node], 0)
+
+        outputs = self.run(source_inputs, reset=True, vectorised=True)
+
+        intervention_values = []
+        for i, (node, stream) in enumerate(node_stream_list):
+            intervention_values.append(outputs[node][i, stream])
+
+        self.reset()
+
+        self.intervene(node_stream_list, intervention_values)
 
     def create_full_graph(self):
         full_graph = nx.DiGraph()
