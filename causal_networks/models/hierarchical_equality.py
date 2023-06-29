@@ -8,6 +8,8 @@ import torch.optim as optim
 
 import numpy as np
 
+from tqdm import tqdm
+
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 from transformer_lens.utils import to_numpy
 
@@ -166,7 +168,7 @@ def make_hier_equal_dag_and_variable_alignment(
 
     # train the model
     print("Training the model...")
-    for epoch in range(task_epochs):
+    for epoch in tqdm(range(task_epochs)):
         outputs = model(data)
         loss = criterion(outputs, labels)
 
@@ -180,7 +182,7 @@ def make_hier_equal_dag_and_variable_alignment(
     correct = (predicted == labels).sum().item()
 
     print(
-        f"Final loss: {loss.item():0.5}. Final accuracy: {correct / task_train_size:0.5%}"
+        f"Final loss: {loss.item():.5}. Final accuracy: {correct / task_train_size:.5%}"
     )
 
     def array_float_validator(value, size_per_input):
