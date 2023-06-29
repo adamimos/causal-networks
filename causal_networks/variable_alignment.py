@@ -793,7 +793,7 @@ class VariableAlignmentTransformer(VariableAlignment):
         self,
         base_input: torch.Tensor,
         source_inputs: torch.Tensor,
-        minibatch_size: int = 32,
+        combined_activations: torch.Tensor,
     ) -> list[tuple[str, callable]]:
         """Get hooks for distributed interchange intervention
 
@@ -810,9 +810,11 @@ class VariableAlignmentTransformer(VariableAlignment):
         seq_len) or (num_dag_nodes, seq_len, seq_len)
             The source inputs to the model, one for each batch element, DAG node and
             token position
-        minibatch_size : int, default=32
-            The batch size to use for running the model. The base and source inputs are
-            split into minibatches of this size, and the model is run on each minibatch.
+        combined_activations : torch.Tensor of shape (batch_size, 1 + num_nodes *
+        seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
+        total_space_size) 
+            The activations of the low-level model on the base input and source inputs,
+            combined
 
         Returns
         -------
@@ -834,6 +836,10 @@ class VariableAlignmentTransformer(VariableAlignment):
         if source_inputs.ndim == 3:
             source_inputs = source_inputs.unsqueeze(0)
 
+        # (batch_size, 1 + num_dag_nodes * seq_len, seq_len, total_space_size)
+        if combined_activations.ndim == 3:
+            combined_activations = combined_activations.unsqueeze(0)
+
         if base_input.shape[0] != source_inputs.shape[0]:
             raise ValueError(
                 f"Expected batch size of base input and source inputs to be the same,"
@@ -846,68 +852,8 @@ class VariableAlignmentTransformer(VariableAlignment):
         base_input = base_input.to(self.device)
         source_inputs = source_inputs.to(self.device)
 
-        # Combine the base input and the source inputs
-        # (batch_size, 1 + num_dag_nodes * seq_len, seq_len)
-        combined_inputs = torch.cat(
-            (
-                base_input.view(batch_size, 1, seq_len),
-                source_inputs.view(batch_size, -1, seq_len),
-            ),
-            dim=1,
-        )
-
-        # (batch_size * (1 + num_dag_nodes * seq_len), seq_len)
-        combined_inputs_flattened = combined_inputs.view(-1, seq_len)
-
-        super_batch_size = combined_inputs_flattened.shape[0]
-
         # (batch_size * (1 + num_dag_nodes * seq_len), seq_len, total_space_size)
-        activation_values = torch.empty(
-            (super_batch_size, seq_len, self.total_space_size),
-            device=self.device,
-        )
-
-        def store_activation_value(
-            value, hook: HookPoint, activation_values, space_index, minibatch_start
-        ):
-            activation_values[
-                minibatch_start : minibatch_start + value.shape[0],
-                ...,
-                space_index : space_index + value.shape[-1],
-            ] = value
-
-        # Hooks to store the activation values.
-        fwd_hooks = []
-        for i, name in enumerate(self.intervene_model_hooks):
-            fwd_hooks.append(
-                (
-                    name,
-                    partial(
-                        store_activation_value,
-                        activation_values=activation_values,
-                        space_index=sum(self.layer_sizes[:i]),
-                    ),
-                )
-            )
-        # TODO: The last hook could raise an exception which gets caught here,
-        # to avoid uselessly running the rest of the model
-
-        if self.verbosity >= 2:
-            print("Running model to determine activation values on source inputs...")
-
-        with torch.no_grad():
-            for minibatch_start in range(0, super_batch_size, minibatch_size):
-                batch_fwd_hooks = []
-                for name, hook in fwd_hooks:
-                    batch_fwd_hooks.append(
-                        (name, partial(hook, minibatch_start=minibatch_start))
-                    )
-                self.low_level_model.run_with_hooks(
-                    combined_inputs_flattened[
-                        minibatch_start : minibatch_start + minibatch_size, ...
-                    ],
-                    fwd_hooks=batch_fwd_hooks,
-                )
+        activation_values = combined_activations.view(-1, seq_len, self.total_space_size)
 
         # (batch_size * (1 + num_dag_nodes * seq_len), seq_len, total_space_size)
         rotated_activation_values = self.rotation(activation_values)
@@ -982,7 +928,7 @@ class VariableAlignmentTransformer(VariableAlignment):
         self,
         base_input: torch.Tensor,
         source_inputs: torch.Tensor,
-        minibatch_size: int = 32,
+        combined_activations: torch.Tensor,
     ) -> torch.Tensor:
         """Compute the output of the low-level model on base and source inputs
 
@@ -999,9 +945,11 @@ class VariableAlignmentTransformer(VariableAlignment):
         source_inputs : torch.Tensor of shape (batch_size, num_dag_nodes, seq_len,
         seq_len) or  (num_dag_nodes, seq_len, seq_len)
             The source inputs to the model
-        minibatch_size : int, default=32
-            The batch size to use for running the model. The base and source inputs are
-            split into minibatches of this size, and the model is run on each minibatch.
+        combined_activations : torch.Tensor of shape (batch_size, 1 + num_nodes *
+        seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
+        total_space_size) 
+            The activations of the low-level model on the base input and source inputs,
+            combined
 
         Returns
         -------
@@ -1013,6 +961,8 @@ class VariableAlignmentTransformer(VariableAlignment):
         if base_input.ndim == 1:
             squeeze_output = True
             base_input = base_input.unsqueeze(0)
+            source_inputs = source_inputs.unsqueeze(0)
+            combined_activations = combined_activations.unsqueeze(0)
         else:
             squeeze_output = False
 
@@ -1021,7 +971,7 @@ class VariableAlignmentTransformer(VariableAlignment):
 
         # Get the patches to apply
         fwd_hooks = self.get_distributed_interchange_intervention_hooks(
-            base_input, source_inputs, minibatch_size=minibatch_size
+            base_input, source_inputs, combined_activations=combined_activations
         )
 
         # Run the model with the patches applied, disabling gradients for the
@@ -1106,9 +1056,9 @@ class VariableAlignmentTransformer(VariableAlignment):
         self,
         base_input: torch.Tensor,
         source_inputs: torch.Tensor,
+        combined_activations: torch.Tensor,
         gold_outputs: Optional[torch.Tensor] = None,
         loss_fn: callable = F.cross_entropy,
-        minibatch_size: int = 32,
     ):
         """Compute the training objective and accuracy of DII
 
@@ -1123,14 +1073,16 @@ class VariableAlignmentTransformer(VariableAlignment):
         source_inputs : torch.Tensor of shape (batch_size, num_dag_nodes, seq_len,
         seq_len) or (num_dag_nodes, seq_len, seq_len)
             The source inputs to the model
+        combined_activations : torch.Tensor of shape (batch_size, 1 + num_nodes *
+        seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
+        total_space_size) 
+            The activations of the low-level model on the base input and source inputs,
+            combined
         gold_outputs : torch.Tensor of shape (batch_size, seq_len), optional
             The gold outputs. If not provided, it will be computed by running
             interchange intervention on the DAG.
         loss_fn : callable, default=F.cross_entropy
             The loss function to use
-        minibatch_size : int, default=32
-            The batch size to use for running the model. The base and source inputs are
-            split into minibatches of this size, and the model is run on each minibatch.
 
         Returns
         -------
@@ -1152,7 +1104,7 @@ class VariableAlignmentTransformer(VariableAlignment):
 
         # Run distributed interchange intervention on the high-level model
         output_low_level = self.run_distributed_interchange_intervention(
-            base_input, source_inputs, minibatch_size=minibatch_size
+            base_input, source_inputs, combined_activations=combined_activations
         )
 
         # Run interchange intervention on the DAG
@@ -1174,8 +1126,76 @@ class VariableAlignmentTransformer(VariableAlignment):
 
         return loss, agreements
 
+    def compute_activation_values(
+        self, inputs: torch.Tensor, batch_size=32
+    ) -> torch.Tensor:
+        """Compute the activation vector for the given inputs
+
+        Parameters
+        ----------
+        inputs : torch.Tensor of shape (num_inputs, seq_len)
+            The inputs to compute the activation vector for
+        batch_size : int, default=32
+            The batch size to use for running the model.
+
+        Returns
+        -------
+        activation_values : torch.Tensor of shape (num_inputs, seq_len, total_space_size)
+            The activation vector for the given inputs
+        """
+
+        num_inputs = inputs.shape[0]
+        seq_len = inputs.shape[1]
+
+        activation_values = torch.empty(
+            (num_inputs, seq_len, self.total_space_size), dtype=torch.float32
+        )
+
+        def store_activation_value(
+            value, hook: HookPoint, activation_values, space_index, batch_start
+        ):
+            activation_values[
+                batch_start : batch_start + value.shape[0],
+                :,
+                space_index : space_index + value.shape[-1],
+            ] = value.to(activation_values.device)
+
+        # Hooks to store the activation values.
+        fwd_hooks = []
+        for i, name in enumerate(self.intervene_model_hooks):
+            fwd_hooks.append(
+                (
+                    name,
+                    partial(
+                        store_activation_value,
+                        activation_values=activation_values,
+                        space_index=sum(self.layer_sizes[:i]),
+                    ),
+                )
+            )
+
+        # Compute them in batches
+        iterator = range(0, num_inputs, batch_size)
+        if self.verbosity >= 1 and self.progress_bar:
+            iterator = tqdm(iterator, desc="Precomputing activation vectors")
+        with torch.no_grad():
+            for batch_start in iterator:
+                batch_fwd_hooks = []
+                for name, hook in fwd_hooks:
+                    batch_fwd_hooks.append(
+                        (name, partial(hook, batch_start=batch_start))
+                    )
+                batch_inputs = inputs[batch_start : batch_start + batch_size, ...]
+                batch_inputs = batch_inputs.to(self.device)
+                self.low_level_model.run_with_hooks(
+                    batch_inputs,
+                    fwd_hooks=batch_fwd_hooks,
+                )
+
+        return activation_values
+
     def create_interchange_intervention_dataset(
-        self, inputs: torch.Tensor, num_samples=10000
+        self, inputs: torch.Tensor, num_samples=10000, batch_size=32
     ) -> TensorDataset:
         """Create a dataset of interchange intervention
 
@@ -1190,12 +1210,15 @@ class VariableAlignmentTransformer(VariableAlignment):
             The inputs to sample from
         num_samples : int, default=10000
             The number of samples to take
+        batch_size : int, default=32
+            The batch size to use for running the low-level model.
 
         Returns
         -------
         dataset : TensorDataset
             A dataset of interchange intervention samples, consisting of the base
-            inputs, source inputs, and gold (DAG) outputs
+            inputs, source inputs, the activation vectors on the combined base and source
+            inputs, and the gold (DAG) outputs
         """
 
         if self.verbosity >= 1:
@@ -1204,17 +1227,37 @@ class VariableAlignmentTransformer(VariableAlignment):
         num_inputs = inputs.shape[0]
         seq_len = inputs.shape[1]
         num_nodes = self.num_nodes
+        device = inputs.device
+
+        activation_values = self.compute_activation_values(
+            inputs, batch_size=batch_size
+        )
 
         # Set the number of DAG streams to be the same as the number of tokens (i.e.
         # `seq_len`)
         self.dag.num_streams = seq_len
 
-        if self.verbosity >= 2:
-            print("[1/4] Sampling base and source inputs...")
-
+        # (num_samples, )
         base_input_indices = torch.randint(0, num_inputs, (num_samples,))
+
+        # (num_samples, num_nodes, seq_len)
         source_input_indices = torch.randint(
             0, num_inputs, (num_samples, num_nodes, seq_len)
+        )
+
+        # (num_samples, num_nodes, seq_len)
+        node_stream_selected_mask = torch.randint(
+            0,
+            2,
+            (num_samples, num_nodes, seq_len),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        source_input_indices = torch.where(
+            node_stream_selected_mask,
+            source_input_indices,
+            base_input_indices.view(num_samples, 1, 1),
         )
 
         # (num_samples, seq_len)
@@ -1223,40 +1266,22 @@ class VariableAlignmentTransformer(VariableAlignment):
         # (num_samples, num_nodes, seq_len, seq_len)
         source_inputs = inputs[source_input_indices]
 
-        if self.verbosity >= 2:
-            print("[2/4] Sampling node and stream mask...")
+        # (num_samples, seq_len, total_space_size)
+        base_input_activations = activation_values[base_input_indices]
 
-        # (num_samples, num_nodes, seq_len)
-        node_stream_selected_mask = torch.randint(
-            0,
-            2,
-            (num_samples, num_nodes, seq_len),
-            dtype=torch.bool,
-            device=self.device,
+        # (num_samples, num_nodes, seq_len, seq_len, total_space_size)
+        source_input_activations = activation_values[source_input_indices]
+
+        # (num_samples, 1 + num_nodes * seq_len, seq_len, total_space_size)
+        combined_input_activations = torch.cat(
+            (
+                base_input_activations.view(num_samples, 1, seq_len, -1),
+                source_input_activations.view(
+                    num_samples, num_nodes * seq_len, seq_len, -1
+                ),
+            ),
+            dim=1,
         )
-
-        # (num_samples, num_nodes, seq_len, seq_len)
-        base_inputs_expanded = base_inputs.view(num_samples, 1, 1, seq_len)
-        base_inputs_expanded = base_inputs_expanded.tile(1, num_nodes, seq_len, 1)
-
-        # (num_samples, num_nodes, seq_len, seq_len)
-        mask_expanded = node_stream_selected_mask.view(
-            num_samples, num_nodes, seq_len, 1
-        )
-        mask_expanded = mask_expanded.tile(1, 1, 1, seq_len)
-
-        if self.verbosity >= 2:
-            print("[3/4] Selecting from source inputs using mask...")
-
-        # (num_samples, num_nodes, seq_len, seq_len)
-        source_inputs = torch.where(
-            mask_expanded,
-            source_inputs,
-            base_inputs_expanded,
-        )
-
-        if self.verbosity >= 2:
-            print("[4/4] Computing gold outputs...")
 
         gold_outputs = torch.empty((num_samples, seq_len), dtype=torch.long)
 
@@ -1270,7 +1295,9 @@ class VariableAlignmentTransformer(VariableAlignment):
             dag_output = dag_output[0]  # Assume there is only one output node. TODO
             gold_outputs[i] = dag_output
 
-        return TensorDataset(base_inputs, source_inputs, gold_outputs)
+        return TensorDataset(
+            base_inputs, source_inputs, combined_input_activations, gold_outputs
+        )
 
     def train_rotation_matrix(
         self,
@@ -1345,15 +1372,17 @@ class VariableAlignmentTransformer(VariableAlignment):
                     total=len(ii_dataloader),
                     desc=f"Epoch [{epoch+1}/{num_epochs}]",
                 )
-            for base_input, source_inputs, gold_outputs in iterator:
+            for base_input, source_inputs, combined_activations, gold_outputs in iterator:
                 base_input = base_input.to(self.device)
                 source_inputs = source_inputs.to(self.device)
+                combined_activations = combined_activations.to(self.device)
                 gold_outputs = gold_outputs.to(self.device)
 
                 loss, agreements = self.dii_training_objective_and_agreement(
                     base_input,
                     source_inputs,
                     gold_outputs=gold_outputs,
+                    combined_activations=combined_activations,
                     minibatch_size=minibatch_size,
                 )
 
