@@ -4,7 +4,7 @@ from typing import Callable, Iterable, Optional, Union
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import IterableDataset, DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 import numpy as np
 
@@ -40,7 +40,7 @@ class ParametrisedOrthogonalMatrix(nn.Module):
         return self
 
 
-class InterchangeInterventionDataset(IterableDataset):
+class InterchangeInterventionDataset(Dataset):
     """A dataset for doing interchange intervention
 
     At each step it selects a random subset of the DAG nodes and random base
@@ -55,28 +55,63 @@ class InterchangeInterventionDataset(IterableDataset):
         The maximum number of steps to run the training for
     """
 
-    def __init__(self, inputs: torch.Tensor, dag_nodes: list[str], num_steps: int):
+    def __init__(
+        self,
+        inputs: torch.Tensor,
+        activation_values: torch.Tensor,
+        base_input_indices: torch.Tensor,
+        source_input_indices: torch.Tensor,
+        gold_outputs: torch.Tensor,
+    ):
         super().__init__()
         self.inputs = inputs
-        self.dag_nodes = dag_nodes
-        self.num_steps = num_steps
-        self.num_nodes = len(dag_nodes)
+        self.activation_values = activation_values
+        self.base_input_indices = base_input_indices
+        self.source_input_indices = source_input_indices
+        self.gold_outputs = gold_outputs
 
-    def __iter__(self):
-        for _ in range(self.num_steps):
-            node_selected_mask = torch.randint(
-                0, 2, (self.num_nodes,), dtype=torch.bool
-            )
-            nodes = [
-                node
-                for node, selected in zip(self.dag_nodes, node_selected_mask)
-                if selected
-            ]
-            inputs_perm = torch.randperm(self.inputs.shape[0])
-            base_input = self.inputs[inputs_perm[0]]
-            source_inputs = self.inputs[inputs_perm[1 : self.num_nodes + 1]]
-            source_inputs[node_selected_mask] = base_input
-            yield nodes, base_input, source_inputs
+    def __len__(self):
+        return self.base_input_indices.shape[0]
+
+    def __getitem__(self, idx):
+
+        if torch.is_tensor(idx):
+            idx_ndim = idx.ndim
+        elif isinstance(idx, slice):
+            idx_ndim = 1
+        else:
+            idx_ndim = 0
+
+        # (num_samples, seq_len)
+        base_inputs = self.inputs[self.base_input_indices[idx]]
+
+        # (num_samples, num_nodes, seq_len, seq_len)
+        source_inputs = self.inputs[self.source_input_indices[idx]]
+
+        # (num_samples, seq_len)
+        gold_outputs = self.gold_outputs[idx]
+
+        # (num_samples, seq_len, total_space_size)
+        base_input_activations = self.activation_values[self.base_input_indices[idx]]
+
+        # (num_samples, num_nodes, seq_len, seq_len, total_space_size)
+        source_input_activations = self.activation_values[self.source_input_indices[idx]]
+
+        # (num_samples, 1 + num_nodes * seq_len, seq_len, total_space_size)
+        combined_input_activations = torch.cat(
+            (
+                base_input_activations.unsqueeze(idx_ndim),
+                source_input_activations.flatten(idx_ndim, idx_ndim + 1),
+            ),
+            dim=idx_ndim,
+        )
+
+        return (
+            base_inputs,
+            source_inputs,
+            combined_input_activations,
+            gold_outputs,
+        )
 
 
 class VariableAlignment:
@@ -812,7 +847,7 @@ class VariableAlignmentTransformer(VariableAlignment):
             token position
         combined_activations : torch.Tensor of shape (batch_size, 1 + num_nodes *
         seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
-        total_space_size) 
+        total_space_size)
             The activations of the low-level model on the base input and source inputs,
             combined
 
@@ -853,7 +888,9 @@ class VariableAlignmentTransformer(VariableAlignment):
         source_inputs = source_inputs.to(self.device)
 
         # (batch_size * (1 + num_dag_nodes * seq_len), seq_len, total_space_size)
-        activation_values = combined_activations.view(-1, seq_len, self.total_space_size)
+        activation_values = combined_activations.view(
+            -1, seq_len, self.total_space_size
+        )
 
         # (batch_size * (1 + num_dag_nodes * seq_len), seq_len, total_space_size)
         rotated_activation_values = self.rotation(activation_values)
@@ -947,7 +984,7 @@ class VariableAlignmentTransformer(VariableAlignment):
             The source inputs to the model
         combined_activations : torch.Tensor of shape (batch_size, 1 + num_nodes *
         seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
-        total_space_size) 
+        total_space_size)
             The activations of the low-level model on the base input and source inputs,
             combined
 
@@ -1075,7 +1112,7 @@ class VariableAlignmentTransformer(VariableAlignment):
             The source inputs to the model
         combined_activations : torch.Tensor of shape (batch_size, 1 + num_nodes *
         seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
-        total_space_size) 
+        total_space_size)
             The activations of the low-level model on the base input and source inputs,
             combined
         gold_outputs : torch.Tensor of shape (batch_size, seq_len), optional
@@ -1196,7 +1233,7 @@ class VariableAlignmentTransformer(VariableAlignment):
 
     def create_interchange_intervention_dataset(
         self, inputs: torch.Tensor, num_samples=10000, batch_size=32
-    ) -> TensorDataset:
+    ) -> InterchangeInterventionDataset:
         """Create a dataset of interchange intervention
 
         Samples `num_samples` instances of base and source inputs from `inputs`. Each
@@ -1215,10 +1252,10 @@ class VariableAlignmentTransformer(VariableAlignment):
 
         Returns
         -------
-        dataset : TensorDataset
-            A dataset of interchange intervention samples, consisting of the base
-            inputs, source inputs, the activation vectors on the combined base and source
-            inputs, and the gold (DAG) outputs
+        dataset : InterchangeInterventionDataset
+            A dataset of interchange intervention samples, which outputs the base
+            inputs, source inputs, the activation vectors on the combined base and
+            source inputs, and the gold (DAG) outputs
         """
 
         if self.verbosity >= 1:
@@ -1266,23 +1303,6 @@ class VariableAlignmentTransformer(VariableAlignment):
         # (num_samples, num_nodes, seq_len, seq_len)
         source_inputs = inputs[source_input_indices]
 
-        # (num_samples, seq_len, total_space_size)
-        base_input_activations = activation_values[base_input_indices]
-
-        # (num_samples, num_nodes, seq_len, seq_len, total_space_size)
-        source_input_activations = activation_values[source_input_indices]
-
-        # (num_samples, 1 + num_nodes * seq_len, seq_len, total_space_size)
-        combined_input_activations = torch.cat(
-            (
-                base_input_activations.view(num_samples, 1, seq_len, -1),
-                source_input_activations.view(
-                    num_samples, num_nodes * seq_len, seq_len, -1
-                ),
-            ),
-            dim=1,
-        )
-
         gold_outputs = torch.empty((num_samples, seq_len), dtype=torch.long)
 
         iterator = range(num_samples)
@@ -1295,8 +1315,12 @@ class VariableAlignmentTransformer(VariableAlignment):
             dag_output = dag_output[0]  # Assume there is only one output node. TODO
             gold_outputs[i] = dag_output
 
-        return TensorDataset(
-            base_inputs, source_inputs, combined_input_activations, gold_outputs
+        return InterchangeInterventionDataset(
+            inputs=inputs,
+            activation_values=activation_values,
+            base_input_indices=base_input_indices,
+            source_input_indices=source_input_indices,
+            gold_outputs=gold_outputs,
         )
 
     def train_rotation_matrix(
@@ -1306,7 +1330,6 @@ class VariableAlignmentTransformer(VariableAlignment):
         num_epochs: int = 10,
         lr: float = 0.01,
         batch_size: int = 32,
-        minibatch_size: int = 32,
         num_samples: int = 10000,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Train the rotation matrix to align the two models
@@ -1328,9 +1351,6 @@ class VariableAlignmentTransformer(VariableAlignment):
             The learning rate to use
         batch_size : int, default=32
             The batch size to use
-        minibatch_size : int, default=32
-            The batch size to use for running the model. The base and source inputs are
-            split into minibatches of this size, and the model is run on each minibatch.
         num_samples : int, default=10000
             The number of samples to take from `inputs` to create the dataset,
             if `inputs` is provided.
@@ -1372,7 +1392,12 @@ class VariableAlignmentTransformer(VariableAlignment):
                     total=len(ii_dataloader),
                     desc=f"Epoch [{epoch+1}/{num_epochs}]",
                 )
-            for base_input, source_inputs, combined_activations, gold_outputs in iterator:
+            for (
+                base_input,
+                source_inputs,
+                combined_activations,
+                gold_outputs,
+            ) in iterator:
                 base_input = base_input.to(self.device)
                 source_inputs = source_inputs.to(self.device)
                 combined_activations = combined_activations.to(self.device)
@@ -1383,7 +1408,6 @@ class VariableAlignmentTransformer(VariableAlignment):
                     source_inputs,
                     gold_outputs=gold_outputs,
                     combined_activations=combined_activations,
-                    minibatch_size=minibatch_size,
                 )
 
                 optimizer.zero_grad()
