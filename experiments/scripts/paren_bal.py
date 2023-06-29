@@ -57,18 +57,18 @@ param_grid = {
     "dataset_file": ["clean_data.csv"],
     "dataset_max_len": [10000],
     "test_proportion": [0.1],
-    "train_ii_dataset_size": [10],
-    "test_ii_dataset_size": [1],
-    "batch_size": [64],
+    "train_ii_dataset_size": [10000],
+    "test_ii_dataset_size": [1000],
+    "batch_size": [128],
     "intervene_node": ["v", "s"],
-    "subspace_size": [16, 64, 256],
+    "subspace_size": [64, 256],
     "intervene_hook": [
         "blocks.0.hook_resid_pre",
         "blocks.0.hook_resid_mid",
         "blocks.0.hook_resid_post",
     ],
     "train_lr": [1, 100, 10000],
-    "num_epochs": [1],
+    "num_epochs": [30],
 }
 
 # An interator over the configurations of hyperparameters
