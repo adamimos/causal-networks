@@ -1,5 +1,6 @@
 from functools import partial
 from typing import Callable, Iterable, Optional, Union
+import time
 
 import torch
 from torch import nn
@@ -157,6 +158,7 @@ class VariableAlignment:
         device: Optional[Union[str, torch.device]] = None,
         verbosity: int = 1,
         progress_bar: bool = True,
+        debug: bool = False,
     ):
         if len(dag_nodes) != len(subspaces_sizes):
             raise ValueError(
@@ -176,6 +178,7 @@ class VariableAlignment:
         self.device = device
         self.verbosity = verbosity
         self.progress_bar = progress_bar
+        self.debug = debug
 
         self.num_nodes = len(dag_nodes)
 
@@ -1139,6 +1142,9 @@ class VariableAlignmentTransformer(VariableAlignment):
         base_input = base_input.to(self.device)
         source_inputs = source_inputs.to(self.device)
 
+        if self.debug:
+            print(f"{time.perf_counter()} Running distributed interchange intervention...")
+
         # Run distributed interchange intervention on the high-level model
         output_low_level = self.run_distributed_interchange_intervention(
             base_input, source_inputs, combined_activations=combined_activations
@@ -1155,6 +1161,9 @@ class VariableAlignmentTransformer(VariableAlignment):
                 gold_output = gold_output[0].to(self.device)
                 gold_outputs.append(gold_output)
             gold_outputs = torch.stack(gold_outputs)
+
+        if self.debug:
+            print(f"{time.perf_counter()} Computing loss...")
 
         # Compute the loss
         loss = loss_fn(output_low_level.flatten(0, 1), gold_outputs.flatten(0, 1))
@@ -1398,6 +1407,10 @@ class VariableAlignmentTransformer(VariableAlignment):
                 combined_activations,
                 gold_outputs,
             ) in iterator:
+                
+                if self.debug:
+                    print(f"{time.perf_counter()} Moving to device...")
+
                 base_input = base_input.to(self.device)
                 source_inputs = source_inputs.to(self.device)
                 combined_activations = combined_activations.to(self.device)
@@ -1410,12 +1423,21 @@ class VariableAlignmentTransformer(VariableAlignment):
                     combined_activations=combined_activations,
                 )
 
+                if self.debug:
+                    print(f"{time.perf_counter()} Stepping optimizer...")
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
+                if self.debug:
+                    print(f"{time.perf_counter()} Updating to stats...")
+
                 total_loss += loss.item()
                 total_agreement += agreements.float().mean().item()
+
+                if self.debug:
+                    print(f"{time.perf_counter()} Loop end...")
 
             losses[epoch] = total_loss / len(ii_dataloader)
             accuracies[epoch] = total_agreement / len(ii_dataloader)
