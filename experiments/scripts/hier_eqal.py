@@ -11,7 +11,8 @@ from sklearn.model_selection import ParameterGrid
 
 import pandas as pd
 
-from causal_networks.models import make_paren_bal_dag_and_variable_alignment
+from causal_networks.models import make_hier_equal_dag_and_variable_alignment
+from causal_networks.models.hierarchical_equality import generate_grouped_data
 
 SCRIPT_PATH = os.path.realpath(__file__)
 PROJECT_DIR = os.path.normpath(SCRIPT_PATH + "/../../..")
@@ -53,21 +54,19 @@ cmd_args = parser.parse_args()
 # The different hyperparameters to test
 param_grid = {
     "seed": [2384],
-    "model_name": ["gelu-1l"],
-    "dataset_file": ["clean_data.csv"],
-    "dataset_max_len": [10000],
-    "test_proportion": [0.1],
+    "hidden_size": [16],
+    "size_per_input": [4],
     "train_ii_dataset_size": [10],
     "test_ii_dataset_size": [1],
-    "batch_size": [64],
-    "intervene_node": ["v", "s"],
-    "subspace_size": [16, 64, 256],
+    "batch_size": [16000],
+    "intervene_nodes": [["b1", "b2"]],
+    "subspace_sizes": [[1, 1], [2, 2], [4, 4], [8, 8]],
     "intervene_hook": [
-        "blocks.0.hook_resid_pre",
-        "blocks.0.hook_resid_mid",
-        "blocks.0.hook_resid_post",
+        "hook_mid1",
+        "hook_mid2",
+        "hook_mid3",
     ],
-    "train_lr": [1, 100, 10000],
+    "train_lr": [0.01],
     "num_epochs": [1],
 }
 
@@ -97,13 +96,13 @@ try:
         time_now = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
 
         # Create a unique run_id for this trial
-        run_id = f"paren_bal_{combo_index}_{time_now}"
+        run_id = f"hier_eqal_{combo_index}_{time_now}"
 
         # Print the run_id and the Parameters
         print()
         print()
         print("=" * 79)
-        title = f"| PAREN BALANCING EXPERIMENT | Run ID: {run_id}"
+        title = f"| HIERARCHICAL EQUALITY EXPERIMENT | Run ID: {run_id}"
         title += (" " * (78 - len(title))) + "|"
         print(title)
         print("=" * 79)
@@ -115,33 +114,25 @@ try:
         np.random.seed(combo["seed"])
 
         print("Making DAG and Variable Alignment...")
-        dag, variable_alignment, model = make_paren_bal_dag_and_variable_alignment(
-            model_name=combo["model_name"],
+        dag, variable_alignment, model = make_hier_equal_dag_and_variable_alignment(
+            hidden_size=combo["hidden_size"],
+            size_per_input=combo["size_per_input"],
             intervene_model_hooks=[combo["intervene_hook"]],
-            intervene_nodes=[combo["intervene_node"]],
-            subspace_sizes=[combo["subspace_size"]],
+            intervene_nodes=combo["intervene_nodes"],
+            subspace_sizes=combo["subspace_sizes"],
             device=f"cuda:{cmd_args.gpu_num}",
         )
 
-        print("Loading dataset...")
-        data_df = pd.read_csv(os.path.join(DATASET_DIR, combo["dataset_file"]))
-        data_df = data_df.iloc[: combo["dataset_max_len"]]
-
-        print("Tokenizing dataset...")
-        data_tokens = model.to_tokens(data_df["text"].values, move_to_device=False)
-
-        print("Creating interchanging intervention datasets...")
-        train_tokens = data_tokens[
-            int(combo["test_proportion"] * data_tokens.shape[0]) :
-        ]
-        test_tokens = data_tokens[
-            : int(combo["test_proportion"] * data_tokens.shape[0])
-        ]
+        print("Generating datasets...")
+        train_inputs, _ = generate_grouped_data(10000, combo["size_per_input"])
+        train_inputs = torch.tensor(train_inputs, dtype=torch.float32)
         train_ii_dataset = variable_alignment.create_interchange_intervention_dataset(
-            train_tokens, num_samples=combo["train_ii_dataset_size"]
+            train_inputs, num_samples=combo["train_ii_dataset_size"]
         )
+        test_inputs, _ = generate_grouped_data(1000, combo["size_per_input"])
+        test_inputs = torch.tensor(test_inputs, dtype=torch.float32)
         test_ii_dataset = variable_alignment.create_interchange_intervention_dataset(
-            test_tokens, num_samples=combo["test_ii_dataset_size"]
+            test_inputs, num_samples=combo["test_ii_dataset_size"]
         )
 
         print("Training rotation matrix...")
