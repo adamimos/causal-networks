@@ -1446,3 +1446,87 @@ class VariableAlignmentTransformer(VariableAlignment):
                 print(f"Loss: {losses[epoch]:0.5f}, Accuracy: {accuracies[epoch]:0.5f}")
 
         return losses, accuracies
+ 
+    @torch.no_grad()
+    def test_rotation_matrix(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        ii_dataset: Optional[TensorDataset] = None,
+        batch_size: int = 32,
+        num_samples: int = 1000,
+    ) -> tuple[float, float]:
+        """Test the rotation matrix for alignment between the two models
+
+        Exactly one of `inputs` or `ii_dataset` must be provided. If `inputs` is
+        provided, it will be used to create an interchange intervention dataset. If
+        `ii_dataset` is provided, it will be used directly.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor of shape (num_inputs, seq_len), optional
+            The input on which to train the rotation matrix. Base and source inputs will
+            be samples from here
+        ii_dataset : TensorDataset, optional
+            The interchange intervention dataset to use
+        batch_size : int, default=32
+            The batch size to use
+        num_samples : int, default=1000
+            The number of samples to take from `inputs` to create the dataset, if
+            `inputs` is provided.
+
+        Returns
+        -------
+        loss : float
+            The average loss
+        accuracy : float
+            The accuracy of the alignment between the low-level model and the DAG
+        """
+
+        if inputs is None and ii_dataset is None:
+            raise ValueError("Either `inputs` or `ii_dataset` must be provided")
+
+        if inputs is not None and ii_dataset is not None:
+            raise ValueError("Only one of `inputs` or `ii_dataset` can be provided")
+
+        if ii_dataset is None:
+            ii_dataset = self.create_interchange_intervention_dataset(
+                inputs, num_samples=num_samples
+            )
+        ii_dataloader = DataLoader(ii_dataset, batch_size=batch_size)
+
+        total_loss = 0.0
+        total_agreement = 0.0
+
+        iterator = ii_dataloader
+        if self.progress_bar:
+            iterator = tqdm(
+                iterator,
+                total=len(ii_dataloader),
+                desc=f"Testing",
+            )
+        for (
+            base_input,
+            source_inputs,
+            combined_activations,
+            gold_outputs,
+        ) in iterator:
+
+            base_input = base_input.to(self.device)
+            source_inputs = source_inputs.to(self.device)
+            combined_activations = combined_activations.to(self.device)
+            gold_outputs = gold_outputs.to(self.device)
+
+            loss, agreements = self.dii_training_objective_and_agreement(
+                base_input,
+                source_inputs,
+                gold_outputs=gold_outputs,
+                combined_activations=combined_activations,
+            )
+
+            total_loss += loss.item()
+            total_agreement += agreements.float().mean().item()
+
+        loss = total_loss / len(ii_dataloader)
+        accuracy = total_agreement / len(ii_dataloader)
+
+        return loss, accuracy
