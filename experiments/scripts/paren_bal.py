@@ -61,15 +61,15 @@ param_grid = {
     "test_proportion": [0.1],
     "train_ii_dataset_size": [10],
     "test_ii_dataset_size": [1],
-    "train_batch_size": [1],
+    "batch_size": [64],
     "intervene_node": ["v", "s"],
-    "subspace_size": [1, 16, 64, 256],
+    "subspace_size": [16, 64, 256],
     "intervene_hook": [
         "blocks.0.hook_resid_pre",
         "blocks.0.hook_resid_mid",
         "blocks.0.hook_resid_post",
     ],
-    "train_lr": [0.01, 1, 100, 10000],
+    "train_lr": [1, 100, 10000],
     "num_epochs": [1],
 }
 
@@ -130,7 +130,7 @@ try:
         data_df = data_df.iloc[: combo["dataset_max_len"]]
 
         print("Tokenizing dataset...")
-        data_tokens = model.to_tokens(data_df["text"].values)
+        data_tokens = model.to_tokens(data_df["text"].values, move_to_device=False)
 
         print("Creating interchanging intervention datasets...")
         train_tokens = data_tokens[
@@ -163,8 +163,8 @@ try:
             "run_id": run_id,
             "combo_index": combo_index,
             "parameters": combo,
-            "train_losses": train_losses,
-            "train_accuracies": train_accuracies,
+            "train_losses": list(train_losses),
+            "train_accuracies": list(train_accuracies),
             "test_loss": test_loss,
             "test_accuracy": test_accuracy,
         }

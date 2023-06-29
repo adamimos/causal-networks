@@ -28,7 +28,7 @@ def make_paren_bal_dag_and_variable_alignment(
     ## Load the model and tokens
     model = HookedTransformer.from_pretrained(model_name, device=device)
 
-    d_vocab = model.config.vocab_size
+    d_vocab = model.tokenizer.vocab_size
 
     open_paren_tokens = model.to_tokens(
         OPEN_PAREN_STR_TOKENS, prepend_bos=False, move_to_device=False, truncate=False
