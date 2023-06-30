@@ -56,8 +56,8 @@ param_grid = {
     "seed": [2384],
     "hidden_size": [16],
     "size_per_input": [4],
-    "train_ii_dataset_size": [10],
-    "test_ii_dataset_size": [1],
+    "train_ii_dataset_size": [1000000],
+    "test_ii_dataset_size": [1000],
     "batch_size": [16000],
     "intervene_nodes": [["b1", "b2"]],
     "subspace_sizes": [[1, 1], [2, 2], [4, 4], [8, 8]],
@@ -67,7 +67,7 @@ param_grid = {
         "hook_mid3",
     ],
     "train_lr": [0.01],
-    "num_epochs": [1],
+    "num_epochs": [50],
 }
 
 # An interator over the configurations of hyperparameters
