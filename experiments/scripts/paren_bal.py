@@ -54,7 +54,7 @@ cmd_args = parser.parse_args()
 param_grid = {
     "seed": [2384],
     "model_name": ["gelu-1l"],
-    "dataset_file": ["clean_data.csv"],
+    "dataset_file": ["paren-balancing/single_line.csv"],
     "dataset_max_len": [10000],
     "test_proportion": [0.1],
     "train_ii_dataset_size": [10000],
