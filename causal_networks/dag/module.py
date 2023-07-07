@@ -56,6 +56,10 @@ class DAGModule(nn.Module, ABC):
         if hook_point is not None:
             self.value = hook_point(self.value)
         return self.value
+    
+    def get_value_as_integer(self) -> torch.LongTensor:
+        """Return the value of the node as integers, if possible"""
+        raise NotImplementedError
 
     def __repr__(self):
         init_kwargs_str = ", ".join(f"{k}={v!r}" for k, v in self._init_kwargs.items())
@@ -82,7 +86,22 @@ class InputNode(DAGModule):
 
 
 class EqualityNode(DAGModule):
-    """A node that checks if two inputs are equal"""
+    """A node that checks if two inputs are equal
+    
+    Parameters
+    ----------
+    dim : int, optional
+        If set, check that all elements along this dimension are equal. This dimension
+        is reduced to size 1 and squeezed out if `keepdim` is False.
+    keepdim : bool, default=True
+        If True, keep the dimension along which the equality is checked. If False, the
+        dimension is squeezed out.
+    """
+
+    def __init__(self, dim: Optional[int] = None, keepdim: bool = True):
+        super().__init__(dim=dim, keepdim=keepdim)
+        self.dim = dim
+        self.keepdim = keepdim
 
     def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.BoolTensor:
         """Return a boolean tensor indicating where the two parent values are equal
@@ -100,11 +119,24 @@ class EqualityNode(DAGModule):
         if len(parent_values) != 2:
             raise ValueError("EqualityNode must have exactly two parents")
         values = list(parent_values.values())
-        return values[0] == values[1]
+        eqaulity_values = values[0] == values[1]
+        if self.dim is not None:
+            eqaulity_values = eqaulity_values.all(dim=self.dim, keepdim=self.keepdim)
+        return eqaulity_values
+    
+    def get_value_as_integer(self) -> torch.LongTensor:
+        """Return the value of the node as integers, if possible"""
+        return self.value.long()
 
 
 class CumSumNode(DAGModule):
-    """A node that computes the cumulative sum of its parents"""
+    """A node that computes the cumulative sum of its parents
+    
+    Parameters
+    ----------
+    dim : int, default=-1
+        The dimension to compute the cumulative sum over
+    """
 
     def __init__(self, dim: int = -1):
         super().__init__(dim=dim)
@@ -127,3 +159,7 @@ class CumSumNode(DAGModule):
             raise ValueError("CumSumNode must have exactly one parent")
         values = list(parent_values.values())
         return torch.cumsum(values[0], dim=self.dim)
+    
+    def get_value_as_integer(self) -> torch.LongTensor:
+        """Return the value of the node as integers, if possible"""
+        return self.value.long()

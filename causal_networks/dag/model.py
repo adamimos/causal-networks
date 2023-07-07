@@ -101,7 +101,10 @@ class DAGModel(HookedRootModule):
         return [node for node in self.graph.nodes if self.graph.out_degree(node) == 0]
 
     def forward(
-        self, inputs: dict[str, torch.Tensor], output_type="output_nodes"
+        self,
+        inputs: dict[str, torch.Tensor],
+        output_type="output_nodes",
+        return_integers=False,
     ) -> dict[str, torch.Tensor]:
         """Forward pass through the DAG
 
@@ -113,6 +116,10 @@ class DAGModel(HookedRootModule):
             The type of output to return. Can be one of:
                 - "output_nodes": only the output nodes
                 - "all_nodes": all node values
+        return_integers : bool, default=False
+            Whether to return the values as integers. If True, the values are converted
+            to integers where possible. Where this is not possible a RuntimeError is
+            raised.
 
         Returns
         -------
@@ -139,16 +146,30 @@ class DAGModel(HookedRootModule):
                     parent_values, hook_point=self.graph.nodes[node]["hook_point"]
                 )
 
-        # Return the values of the nodes
+        # Determine the requested output nodes
         if output_type == "output_nodes":
-            output_nodes = self.get_output_nodes()
-            return {
-                node: self.graph.nodes[node]["module"].value for node in output_nodes
-            }
+            requested_nodes = self.get_output_nodes()
         elif output_type == "all_nodes":
-            return {node: self.graph.nodes[node]["module"].value for node in self.graph}
+            requested_nodes = self.graph.nodes
         else:
             raise ValueError(f"Unknown output type {output_type}")
+
+        # Return the requested output node values, converting to integers if requested
+        if return_integers:
+            requested_values = {}
+            for node in requested_nodes:
+                module = self.graph.nodes[node]["module"]
+                try:
+                    requested_values[node] = module.get_value_as_integer()
+                except NotImplementedError:
+                    raise RuntimeError(
+                        f"Cannot convert value of node {node} to integer"
+                    )
+            return requested_values
+        else:
+            return {
+                node: self.graph.nodes[node]["module"].value for node in requested_nodes
+            }
 
     def run_interchange_intervention(
         self,
@@ -156,6 +177,7 @@ class DAGModel(HookedRootModule):
         source_inputs: dict[str, torch.Tensor],
         intervention_mask: dict[str, torch.BoolTensor],
         output_type="output_nodes",
+        return_integers=False,
     ) -> dict[str, torch.Tensor]:
         """Run interchange intervention with base and source inputs
 
@@ -188,6 +210,10 @@ class DAGModel(HookedRootModule):
             The type of output to return. Can be one of:
                 - "output_nodes": only the output nodes
                 - "all_nodes": all node values
+        return_integers : bool, default=False
+            Whether to return the values as integers. If True, the values are converted
+            to integers where possible. Where this is not possible a RuntimeError is
+            raised.
 
         Returns
         -------
@@ -246,11 +272,14 @@ class DAGModel(HookedRootModule):
 
         # Run the forward pass with the base input and the intervention hooks
         output = self.run_with_hooks(
-            base_input, fwd_hooks=fwd_hooks, output_type=output_type
+            base_input,
+            fwd_hooks=fwd_hooks,
+            output_type=output_type,
+            return_integers=return_integers,
         )
 
         return output
-    
+
     def set_visualization_layout(self, layout_function: Optional[callable]):
         """Set the layout function for visualizing the DAG
 
