@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.nn.utils.parametrizations import orthogonal
 
 import numpy as np
 
@@ -23,11 +24,10 @@ class ParametrisedOrthogonalMatrix(nn.Module):
     def __init__(self, size: int):
         super().__init__()
         self.size = size
-        self.theta = nn.Parameter(torch.randn(size, size))
+        self.orthogonal_parameter = orthogonal(nn.Linear(size, size, bias=False))
 
     def get_orthogonal_matrix(self) -> torch.Tensor:
-        Q, R = torch.linalg.qr(self.theta)
-        return Q
+        return self.orthogonal_parameter.weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.matmul(x, self.get_orthogonal_matrix())
@@ -37,7 +37,7 @@ class ParametrisedOrthogonalMatrix(nn.Module):
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
-        self.theta = self.theta.to(*args, **kwargs)
+        self.orthogonal_parameter = self.orthogonal_parameter.to(*args, **kwargs)
         return self
 
 
