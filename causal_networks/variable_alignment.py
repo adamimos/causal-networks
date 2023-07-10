@@ -299,7 +299,10 @@ class VariableAlignment:
         self.progress_bar = progress_bar
         self.debug = debug
 
-        self.num_nodes = len(dag_nodes)
+        self._setup()
+
+    def _setup(self):
+        self.num_nodes = len(self.dag_nodes)
 
         self.layer_sizes = self._determine_layer_sizes()
         self.total_space_size = sum(self.layer_sizes)
@@ -695,14 +698,6 @@ class VariableAlignment:
             interventions
         """
 
-        if base_input.ndim == 1:
-            base_input = base_input.unsqueeze(0)
-        if source_inputs.ndim == 2:
-            source_inputs = source_inputs.unsqueeze(0)
-
-        base_input = base_input.to(self.device)
-        source_inputs = source_inputs.to(self.device)
-
         # Run distributed interchange intervention on the high-level model
         output_low_level = self.run_distributed_interchange_intervention(
             base_input, source_inputs, combined_activations
@@ -724,7 +719,7 @@ class VariableAlignment:
         batch_size: int = 32,
         num_samples: int = 10000,
         shuffle: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[Float[np.ndarray, "num_epochs"], Float[np.ndarray, "num_epochs"]]:
         """Train the rotation matrix to align the two models
 
         Exactly one of `inputs` or `ii_dataset` must be provided. If `inputs` is
@@ -870,7 +865,9 @@ class VariableAlignment:
                 inputs, num_samples=num_samples
             )
 
-        ii_dataloader = DataLoader(ii_dataset, batch_size=batch_size)
+        sampler = SequentialSampler(ii_dataset)
+        sampler = BatchSampler(sampler, batch_size=batch_size, drop_last=False)
+        ii_dataloader = DataLoader(ii_dataset, sampler=sampler, batch_size=None)
 
         total_loss = 0.0
         total_agreement = 0.0
@@ -904,792 +901,637 @@ class VariableAlignment:
         return loss, accuracy
 
 
-# class TransformerVariableAlignment(VariableAlignment):
-#     """A variable alignment between a recurrent DAG and a transformer
-
-#     Parameters
-#     ----------
-#     dag : RecurrentDeterministicDAG
-#         The DAG to align to the model
-#     low_level_model : HookedTransformer
-#         The hooked low-level model to align to the DAG
-#     dag_nodes : list[str]
-#         The names of the nodes (variables) of the DAG to align
-#     input_alignment : callable
-#         A function mapping (batches of) model input tensors to DAG input dictionaries
-#     output_alignment : callable
-#         A function mapping (batches of) model output tensors to DAG output values
-#     intervene_model_hooks : list[str]
-#         The names of the model hooks together give the whole activation space for
-#         alignment the DAG nodes
-#     subspaces_sizes : list[int]
-#         The sizes of the subspaces to use for each DAG nodes
-#     output_modifier : callable, optional
-#         A function to modify the output of the low-level model before comparing it with
-#         the DAG output
-#     device : Union[str, torch.device], default=None
-#         The device to put everything on. If None, use CUDA if available, otherwise CPU
-#     verbosity : int, default=1
-#         The verbosity level
-#     progress_bar : bool, default=True
-#         Whether to show a progress bar during and dataset generation
-#     """
-
-#     dag: RecurrentDeterministicDAG
-
-#     def __init__(
-#         self,
-#         dag: RecurrentDeterministicDAG,
-#         low_level_model: HookedTransformer,
-#         dag_nodes: list[str],
-#         input_alignment: callable,
-#         output_alignment: callable,
-#         intervene_model_hooks: list[str],
-#         subspaces_sizes: list[int],
-#         output_modifier: Optional[callable] = None,
-#         device: Optional[Union[str, torch.device]] = None,
-#         verbosity: int = 1,
-#         progress_bar: bool = True,
-#     ):
-#         super().__init__(
-#             dag=dag,
-#             low_level_model=low_level_model,
-#             dag_nodes=dag_nodes,
-#             input_alignment=input_alignment,
-#             output_alignment=output_alignment,
-#             intervene_model_hooks=intervene_model_hooks,
-#             subspaces_sizes=subspaces_sizes,
-#             device=device,
-#             verbosity=verbosity,
-#             progress_bar=progress_bar,
-#         )
-
-#         self.output_modifier = output_modifier
-
-#         self.d_vocab = self.low_level_model.cfg.d_vocab
-
-#     def _determine_layer_sizes(self) -> list[int]:
-#         """Run the model to determine the sizes of the activation spaces"""
-
-#         if self.verbosity > 0:
-#             print("Running model to determine activation space size...")
-
-#         sizes = []
-
-#         def counter_hook(value, hook: HookPoint, sizes):
-#             sizes.append(value.shape[-1])
-
-#         partial_counter_hook = partial(counter_hook, sizes=sizes)
-
-#         x = torch.zeros(1, 1, device=self.device, dtype=torch.long)
-#         fwd_hooks = [
-#             (name, partial_counter_hook) for name in self.intervene_model_hooks
-#         ]
-
-#         self.low_level_model.run_with_hooks(x, fwd_hooks=fwd_hooks)
-
-#         return sizes
-
-#     def get_distributed_interchange_intervention_hooks(
-#         self,
-#         base_input: Tensor,
-#         source_inputs: Tensor,
-#         combined_activations: Tensor,
-#     ) -> list[tuple[str, callable]]:
-#         """Get hooks for distributed interchange intervention
-
-#         Runs the model on the base input and each source input, and on input `i` records
-#         the value of the projection of the rotated activation space onto the `i`th
-#         subspace. It then builds hooks to patch in these values into the rotated
-#         activation space.
-
-#         Parameters
-#         ----------
-#         base_input : Tensor of shape (batch_size, seq_len) or (seq_len)
-#             The base input to the model
-#         source_inputs : Tensor of shape (batch_size, num_nodes, seq_len,
-#         seq_len) or (num_nodes, seq_len, seq_len)
-#             The source inputs to the model, one for each batch element, DAG node and
-#             token position
-#         combined_activations : Tensor of shape (batch_size, 1 + num_nodes *
-#         seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
-#         total_space_size)
-#             The activations of the low-level model on the base input and source inputs,
-#             combined
-
-#         Returns
-#         -------
-#         list[tuple[str, callable]]
-#             The hooks to use for distributed interchange intervention, for each of
-#             `self.intervene_model_hooks`
-#         """
-
-#         if source_inputs.shape[-3] != self.num_nodes:
-#             raise ValueError(
-#                 f"Expected {self.num_nodes} source inputs, got {source_inputs.shape[-3]}"
-#             )
-
-#         # (batch_size, seq_len)
-#         if base_input.ndim == 1:
-#             base_input = base_input.unsqueeze(0)
-
-#         # (batch_size, num_nodes, seq_len, seq_len)
-#         if source_inputs.ndim == 3:
-#             source_inputs = source_inputs.unsqueeze(0)
-
-#         # (batch_size, 1 + num_nodes * seq_len, seq_len, total_space_size)
-#         if combined_activations.ndim == 3:
-#             combined_activations = combined_activations.unsqueeze(0)
-
-#         if base_input.shape[0] != source_inputs.shape[0]:
-#             raise ValueError(
-#                 f"Expected batch size of base input and source inputs to be the same,"
-#                 f" got {base_input.shape[0]} and {source_inputs.shape[0]}"
-#             )
-
-#         batch_size = base_input.shape[0]
-#         seq_len = base_input.shape[1]
-
-#         base_input = base_input.to(self.device)
-#         source_inputs = source_inputs.to(self.device)
-
-#         # (batch_size * (1 + num_nodes * seq_len), seq_len, total_space_size)
-#         activation_values = combined_activations.view(
-#             -1, seq_len, self.total_space_size
-#         )
-
-#         # (batch_size * (1 + num_nodes * seq_len), seq_len, total_space_size)
-#         rotated_activation_values = self.rotation(activation_values)
-
-#         # Select the rotated activation values which are relevant, for patching in. We
-#         # select the indices of Y_0 for the base input across all positions at once, and
-#         # select indices of each Y_i for each position, since we patch in for each tuple
-#         # (node, stream) separately (these are dimensions 1 and 2 of `source_inputs`).
-#         super_batch_indices = torch.empty(
-#             (batch_size, seq_len, self.total_space_size), device=self.device, dtype=int
-#         )
-#         pos_indices = torch.arange(seq_len, device=self.device, dtype=int)
-#         pos_indices = pos_indices.view(1, -1, 1)
-#         space_indices = torch.arange(
-#             self.total_space_size, device=self.device, dtype=int
-#         )
-#         space_indices = space_indices.view(1, 1, -1)
-
-#         # Compute the indices for the super batch dimension (i.e. then batch_size * (1 +
-#         # num_nodes * seq_len) one). Select Y_0 across all positions, and each Y_i
-#         # for each position.
-#         sub_batch_size = 1 + self.num_nodes * seq_len
-#         super_batch_indices[:, :, : self.y_0_size] = (
-#             torch.arange(batch_size).view(batch_size, 1, 1) * sub_batch_size
-#         )
-#         space_index = self.y_0_size
-#         for i, subspace_size in enumerate(self.subspaces_sizes, start=1):
-#             super_batch_indices[:, :, space_index : space_index + subspace_size] = (
-#                 torch.arange(batch_size).view(batch_size, 1, 1) * sub_batch_size
-#                 + (i - 1) * seq_len
-#                 + torch.arange(seq_len).view(1, seq_len, 1)
-#             )
-#             space_index += subspace_size
-
-#         # (batch_size, seq_len, total_space_size)
-#         new_rotated_activation_values = rotated_activation_values[
-#             super_batch_indices, pos_indices, space_indices
-#         ]
-
-#         # Unrotate the new rotated activation values, to get a vector
-#         # consisting of all the activation values to be patched in
-#         # (batch_size, seq_len, total_space_size)
-#         new_activation_values = self.rotation.inverse(new_rotated_activation_values)
-
-#         def intervention_hook(
-#             value,
-#             hook: HookPoint,
-#             space_index,
-#             new_activation_values,
-#         ):
-#             value[:] = new_activation_values[
-#                 ..., space_index : space_index + value.shape[-1]
-#             ]
-#             return value
-
-#         fwd_hooks = []
-#         for i, name in enumerate(self.intervene_model_hooks):
-#             fwd_hooks.append(
-#                 (
-#                     name,
-#                     partial(
-#                         intervention_hook,
-#                         space_index=sum(self.layer_sizes[:i]),
-#                         new_activation_values=new_activation_values,
-#                     ),
-#                 )
-#             )
-
-#         return fwd_hooks
-
-#     def run_distributed_interchange_intervention(
-#         self,
-#         base_input: Tensor,
-#         source_inputs: Tensor,
-#         combined_activations: Tensor,
-#     ) -> Tensor:
-#         """Compute the output of the low-level model on base and source inputs
-
-#         Does distributed interchange intervention, patching in the activation values
-#         from the source inputs, then running on the base input
-
-#         **Warning**: This method will disable gradients for the model parameters,
-#         setting `requires_grad` to `False`.
-
-#         Parameters
-#         ----------
-#         base_input : Tensor of shape (batch_size, seq_len) or (seq_len,)
-#             The base input to the model
-#         source_inputs : Tensor of shape (batch_size, num_nodes, seq_len,
-#         seq_len) or  (num_nodes, seq_len, seq_len)
-#             The source inputs to the model
-#         combined_activations : Tensor of shape (batch_size, 1 + num_nodes *
-#         seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
-#         total_space_size)
-#             The activations of the low-level model on the base input and source inputs,
-#             combined
-
-#         Returns
-#         -------
-#         output : Tensor of shape (batch_size, seq_len, ...) or (seq_len, ...)
-#             The output of the low-level model (plus the output modifier, if set) on the
-#             base input and source inputs
-#         """
-
-#         if base_input.ndim == 1:
-#             squeeze_output = True
-#             base_input = base_input.unsqueeze(0)
-#             source_inputs = source_inputs.unsqueeze(0)
-#             combined_activations = combined_activations.unsqueeze(0)
-#         else:
-#             squeeze_output = False
-
-#         base_input = base_input.to(self.device)
-#         source_inputs = source_inputs.to(self.device)
-
-#         # Get the patches to apply
-#         fwd_hooks = self.get_distributed_interchange_intervention_hooks(
-#             base_input, source_inputs, combined_activations=combined_activations
-#         )
-
-#         # Run the model with the patches applied, disabling gradients for the
-#         # model parameters, but not the rotation matrix used in the hooks
-#         self.low_level_model.requires_grad_(False)
-#         output = self.low_level_model.run_with_hooks(base_input, fwd_hooks=fwd_hooks)
-
-#         if squeeze_output:
-#             output = output.squeeze(0)
-
-#         if self.output_modifier is not None:
-#             output = self.output_modifier(output)
-
-#         return output
-
-#     def run_interchange_intervention(
-#         self,
-#         base_input: Tensor,
-#         source_inputs: Tensor,
-#         output_type: str = "output_integer",
-#     ) -> Tensor:
-#         """Run interchange intervention on the DAG
-
-#         Uses the vectorised runner if available.
-
-#         Parameters
-#         ----------
-#         base_input : Tensor of shape (seq_len, )
-#             The base input to the model
-#         source_inputs : Tensor of shape (num_nodes, seq_len, seq_len)
-#             The source inputs to the model
-#         output_type : str, optional
-#             The type of output to return, by default "output_integer"
-
-#         Returns
-#         -------
-#         dag_output : Tensor of shape (num_output_nodes, seq_len)
-#             The output of the dag, as integers ranging over the possible
-#             output values
-#         """
-
-#         seq_len = base_input.shape[0]
-
-#         # (num_nodes * seq_len, seq_len)
-#         source_inputs = source_inputs.view(-1, seq_len)
-
-#         vectorised = self.dag.vectorised_runner is not None
-
-#         # Convert the inputs into things the DAG can handle
-#         base_input_dag = self.input_alignment(base_input)
-#         source_inputs_dag = self.input_alignment(source_inputs, vectorised=vectorised)
-
-#         # Run the intervention to create a patched model
-#         if vectorised:
-#             node_stream_list = [
-#                 (dag_node, stream)
-#                 for dag_node in self.dag_nodes
-#                 for stream in range(seq_len)
-#             ]
-#             self.dag.do_interchange_intervention_vectorised_single_node_streams(
-#                 node_stream_list, source_inputs_dag
-#             )
-#         else:
-#             dag_node_singletons = [
-#                 [(dag_node, stream)]
-#                 for dag_node in self.dag_nodes
-#                 for stream in range(seq_len)
-#             ]
-#             self.dag.do_interchange_intervention(dag_node_singletons, source_inputs_dag)
-
-#         # Run the patched model on the base input
-#         output = self.dag.run(
-#             base_input_dag,
-#             reset=False,
-#             output_type=output_type,
-#             output_format="torch",
-#         )
-
-#         return output
-
-#     def dii_training_objective_and_agreement(
-#         self,
-#         base_input: Tensor,
-#         source_inputs: Tensor,
-#         combined_activations: Tensor,
-#         gold_outputs: Optional[Tensor] = None,
-#         loss_fn: callable = F.cross_entropy,
-#     ):
-#         """Compute the training objective and accuracy of DII
-
-#         Returns both the loss and a boolean for agreement between performing distributed
-#         interchange intervention on the low-level model and interchange intervention on
-#         the DAG.
-
-#         Parameters
-#         ----------
-#         base_input : Tensor of shape (batch_size, seq_len) or (seq_len,)
-#             The base input to the model
-#         source_inputs : Tensor of shape (batch_size, num_nodes, seq_len,
-#         seq_len) or (num_nodes, seq_len, seq_len)
-#             The source inputs to the model
-#         combined_activations : Tensor of shape (batch_size, 1 + num_nodes *
-#         seq_len, seq_len, total_space_size) or (1 + num_nodes * seq_len, seq_len,
-#         total_space_size)
-#             The activations of the low-level model on the base input and source inputs,
-#             combined
-#         gold_outputs : Tensor of shape (batch_size, seq_len), optional
-#             The gold outputs. If not provided, it will be computed by running
-#             interchange intervention on the DAG.
-#         loss_fn : callable, default=F.cross_entropy
-#             The loss function to use
-
-#         Returns
-#         -------
-#         loss : Tensor of shape (1,)
-#             The training objective output
-#         agreements : Tensor of shape (batch_size, seq_len)
-#             Whether the low-level model and the DAG agree on the output after doing
-#             interventions
-#         """
-#         if base_input.ndim == 1:
-#             base_input = base_input.unsqueeze(0)
-#         if source_inputs.ndim == 2:
-#             source_inputs = source_inputs.unsqueeze(0)
-
-#         batch_size = base_input.shape[0]
-
-#         base_input = base_input.to(self.device)
-#         source_inputs = source_inputs.to(self.device)
-
-#         if self.debug:
-#             print(
-#                 f"{time.perf_counter()} Running distributed interchange intervention..."
-#             )
-
-#         # Run distributed interchange intervention on the high-level model
-#         output_low_level = self.run_distributed_interchange_intervention(
-#             base_input, source_inputs, combined_activations=combined_activations
-#         )
-
-#         # Run interchange intervention on the DAG
-#         if gold_outputs is None:
-#             gold_outputs = []
-#             for i in range(batch_size):
-#                 gold_output = self.run_interchange_intervention(
-#                     base_input[i], source_inputs[i], output_type="output_integer"
-#                 )
-#                 # Assume there is only one output node. TODO
-#                 gold_output = gold_output[0].to(self.device)
-#                 gold_outputs.append(gold_output)
-#             gold_outputs = torch.stack(gold_outputs)
-
-#         if self.debug:
-#             print(f"{time.perf_counter()} Computing loss...")
-
-#         # Compute the loss
-#         loss = loss_fn(output_low_level.flatten(0, 1), gold_outputs.flatten(0, 1))
-
-#         agreements = output_low_level.argmax(dim=-1) == gold_outputs
-
-#         return loss, agreements
-
-#     def compute_activation_values(
-#         self, inputs: Tensor, batch_size=32
-#     ) -> Tensor:
-#         """Compute the activation vector for the given inputs
-
-#         Parameters
-#         ----------
-#         inputs : Tensor of shape (num_inputs, seq_len)
-#             The inputs to compute the activation vector for
-#         batch_size : int, default=32
-#             The batch size to use for running the model.
-
-#         Returns
-#         -------
-#         activation_values : Tensor of shape (num_inputs, seq_len, total_space_size)
-#             The activation vector for the given inputs
-#         """
-
-#         num_inputs = inputs.shape[0]
-#         seq_len = inputs.shape[1]
-
-#         activation_values = torch.empty(
-#             (num_inputs, seq_len, self.total_space_size), dtype=torch.float32
-#         )
-
-#         def store_activation_value(
-#             value, hook: HookPoint, activation_values, space_index, batch_start
-#         ):
-#             activation_values[
-#                 batch_start : batch_start + value.shape[0],
-#                 :,
-#                 space_index : space_index + value.shape[-1],
-#             ] = value.to(activation_values.device)
-
-#         # Hooks to store the activation values.
-#         fwd_hooks = []
-#         for i, name in enumerate(self.intervene_model_hooks):
-#             fwd_hooks.append(
-#                 (
-#                     name,
-#                     partial(
-#                         store_activation_value,
-#                         activation_values=activation_values,
-#                         space_index=sum(self.layer_sizes[:i]),
-#                     ),
-#                 )
-#             )
-
-#         # Compute them in batches
-#         iterator = range(0, num_inputs, batch_size)
-#         if self.verbosity >= 1 and self.progress_bar:
-#             iterator = tqdm(iterator, desc="Precomputing activation vectors")
-#         with torch.no_grad():
-#             for batch_start in iterator:
-#                 batch_fwd_hooks = []
-#                 for name, hook in fwd_hooks:
-#                     batch_fwd_hooks.append(
-#                         (name, partial(hook, batch_start=batch_start))
-#                     )
-#                 batch_inputs = inputs[batch_start : batch_start + batch_size, ...]
-#                 batch_inputs = batch_inputs.to(self.device)
-#                 self.low_level_model.run_with_hooks(
-#                     batch_inputs,
-#                     fwd_hooks=batch_fwd_hooks,
-#                 )
-
-#         return activation_values
-
-#     def create_interchange_intervention_dataset(
-#         self, inputs: Tensor, num_samples=10000, batch_size=32
-#     ) -> TransformerInterchangeInterventionDataset:
-#         """Create a dataset of interchange intervention
-
-#         Samples `num_samples` instances of base and source inputs from `inputs`. Each
-#         sample consists of a random subset of the DAG nodes and streams and random base
-#         and source inputs. It always returns the same number of source inputs, filling
-#         in for missing nodes with the base input.
-
-#         Parameters
-#         ----------
-#         inputs : Tensor of shape (num_inputs, seq_len)
-#             The inputs to sample from
-#         num_samples : int, default=10000
-#             The number of samples to take
-#         batch_size : int, default=32
-#             The batch size to use for running the low-level model.
-
-#         Returns
-#         -------
-#         dataset : TransformerInterchangeInterventionDataset
-#             A dataset of interchange intervention samples, which outputs the base
-#             inputs, source inputs, the activation vectors on the combined base and
-#             source inputs, and the gold (DAG) outputs
-#         """
-
-#         if self.verbosity >= 1:
-#             print("Creating interchange intervention dataset...")
-
-#         num_inputs = inputs.shape[0]
-#         seq_len = inputs.shape[1]
-#         num_nodes = self.num_nodes
-#         device = inputs.device
-
-#         activation_values = self.compute_activation_values(
-#             inputs, batch_size=batch_size
-#         )
-
-#         # Set the number of DAG streams to be the same as the number of tokens (i.e.
-#         # `seq_len`)
-#         self.dag.num_streams = seq_len
-
-#         # (num_samples, )
-#         base_input_indices = torch.randint(0, num_inputs, (num_samples,))
-
-#         # (num_samples, num_nodes, seq_len)
-#         source_input_indices = torch.randint(
-#             0, num_inputs, (num_samples, num_nodes, seq_len)
-#         )
-
-#         # (num_samples, num_nodes, seq_len)
-#         node_stream_selected_mask = torch.randint(
-#             0,
-#             2,
-#             (num_samples, num_nodes, seq_len),
-#             dtype=torch.bool,
-#             device=device,
-#         )
-
-#         source_input_indices = torch.where(
-#             node_stream_selected_mask,
-#             source_input_indices,
-#             base_input_indices.view(num_samples, 1, 1),
-#         )
-
-#         # (num_samples, seq_len)
-#         base_inputs = inputs[base_input_indices]
-
-#         # (num_samples, num_nodes, seq_len, seq_len)
-#         source_inputs = inputs[source_input_indices]
-
-#         gold_outputs = torch.empty((num_samples, seq_len), dtype=torch.long)
-
-#         iterator = range(num_samples)
-#         if self.verbosity >= 1 and self.progress_bar:
-#             iterator = tqdm(iterator, desc="Computing gold outputs")
-#         for i in iterator:
-#             dag_output = self.run_interchange_intervention(
-#                 base_inputs[i], source_inputs[i], output_type="output_integer"
-#             )
-#             dag_output = dag_output[0]  # Assume there is only one output node. TODO
-#             gold_outputs[i] = dag_output
-
-#         return TransformerInterchangeInterventionDataset(
-#             inputs=inputs,
-#             activation_values=activation_values,
-#             base_input_indices=base_input_indices,
-#             source_input_indices=source_input_indices,
-#             gold_outputs=gold_outputs,
-#         )
-
-#     def train_rotation_matrix(
-#         self,
-#         inputs: Optional[Tensor] = None,
-#         ii_dataset: Optional[TensorDataset] = None,
-#         num_epochs: int = 10,
-#         lr: float = 0.01,
-#         batch_size: int = 32,
-#         num_samples: int = 10000,
-#     ) -> tuple[np.ndarray, np.ndarray]:
-#         """Train the rotation matrix to align the two models
-
-#         Exactly one of `inputs` or `ii_dataset` must be provided. If `inputs`
-#         is provided, it will be used to create an interchange intervention
-#         dataset. If `ii_dataset` is provided, it will be used directly.
-
-#         Parameters
-#         ----------
-#         inputs : Tensor of shape (num_inputs, seq_len), optional
-#             The input on which to train the rotation matrix. Base and source
-#             inputs will be samples from here
-#         ii_dataset : TensorDataset, optional
-#             The interchange intervention dataset to use
-#         num_epochs : int, default=0
-#             The number of epochs to train the rotation matrix for
-#         lr : float, default=0.01
-#             The learning rate to use
-#         batch_size : int, default=32
-#             The batch size to use
-#         num_samples : int, default=10000
-#             The number of samples to take from `inputs` to create the dataset,
-#             if `inputs` is provided.
-
-#         Returns
-#         -------
-#         losses : np.ndarray of shape (num_epochs,)
-#             The average loss at each epoch
-#         accuracies : np.ndarray of shape (num_epochs,)
-#             At each epoch the accuracy of the alignment between the low-level
-#             model and the DAG
-#         """
-
-#         if inputs is None and ii_dataset is None:
-#             raise ValueError("Either `inputs` or `ii_dataset` must be provided")
-
-#         if inputs is not None and ii_dataset is not None:
-#             raise ValueError("Only one of `inputs` or `ii_dataset` can be provided")
-
-#         if ii_dataset is None:
-#             ii_dataset = self.create_interchange_intervention_dataset(
-#                 inputs, num_samples=num_samples
-#             )
-#         ii_dataloader = DataLoader(ii_dataset, batch_size=batch_size)
-
-#         optimizer = torch.optim.SGD(self.rotation.parameters(), lr=lr)
-
-#         losses = np.empty(num_epochs)
-#         accuracies = np.empty(num_epochs)
-
-#         for epoch in range(num_epochs):
-#             total_loss = 0.0
-#             total_agreement = 0.0
-
-#             iterator = ii_dataloader
-#             if self.progress_bar:
-#                 iterator = tqdm(
-#                     iterator,
-#                     total=len(ii_dataloader),
-#                     desc=f"Epoch [{epoch+1}/{num_epochs}]",
-#                 )
-#             for (
-#                 base_input,
-#                 source_inputs,
-#                 combined_activations,
-#                 gold_outputs,
-#             ) in iterator:
-#                 if self.debug:
-#                     print(f"{time.perf_counter()} Moving to device...")
-
-#                 base_input = base_input.to(self.device)
-#                 source_inputs = source_inputs.to(self.device)
-#                 combined_activations = combined_activations.to(self.device)
-#                 gold_outputs = gold_outputs.to(self.device)
-
-#                 loss, agreements = self.dii_training_objective_and_agreement(
-#                     base_input,
-#                     source_inputs,
-#                     gold_outputs=gold_outputs,
-#                     combined_activations=combined_activations,
-#                 )
-
-#                 if self.debug:
-#                     print(f"{time.perf_counter()} Stepping optimizer...")
-
-#                 optimizer.zero_grad()
-#                 loss.backward()
-#                 optimizer.step()
-
-#                 if self.debug:
-#                     print(f"{time.perf_counter()} Updating to stats...")
-
-#                 total_loss += loss.item()
-#                 total_agreement += agreements.float().mean().item()
-
-#                 if self.debug:
-#                     print(f"{time.perf_counter()} Loop end...")
-
-#             losses[epoch] = total_loss / len(ii_dataloader)
-#             accuracies[epoch] = total_agreement / len(ii_dataloader)
-
-#             if self.verbosity >= 1:
-#                 print(f"Loss: {losses[epoch]:0.5f}, Accuracy: {accuracies[epoch]:0.5f}")
-
-#         return losses, accuracies
-
-#     @torch.no_grad()
-#     def test_rotation_matrix(
-#         self,
-#         inputs: Optional[Tensor] = None,
-#         ii_dataset: Optional[TensorDataset] = None,
-#         batch_size: int = 32,
-#         num_samples: int = 1000,
-#     ) -> tuple[float, float]:
-#         """Test the rotation matrix for alignment between the two models
-
-#         Exactly one of `inputs` or `ii_dataset` must be provided. If `inputs` is
-#         provided, it will be used to create an interchange intervention dataset. If
-#         `ii_dataset` is provided, it will be used directly.
-
-#         Parameters
-#         ----------
-#         inputs : Tensor of shape (num_inputs, seq_len), optional
-#             The input on which to train the rotation matrix. Base and source inputs will
-#             be samples from here
-#         ii_dataset : TensorDataset, optional
-#             The interchange intervention dataset to use
-#         batch_size : int, default=32
-#             The batch size to use
-#         num_samples : int, default=1000
-#             The number of samples to take from `inputs` to create the dataset, if
-#             `inputs` is provided.
-
-#         Returns
-#         -------
-#         loss : float
-#             The average loss
-#         accuracy : float
-#             The accuracy of the alignment between the low-level model and the DAG
-#         """
-
-#         if inputs is None and ii_dataset is None:
-#             raise ValueError("Either `inputs` or `ii_dataset` must be provided")
-
-#         if inputs is not None and ii_dataset is not None:
-#             raise ValueError("Only one of `inputs` or `ii_dataset` can be provided")
-
-#         if ii_dataset is None:
-#             ii_dataset = self.create_interchange_intervention_dataset(
-#                 inputs, num_samples=num_samples
-#             )
-#         ii_dataloader = DataLoader(ii_dataset, batch_size=batch_size)
-
-#         total_loss = 0.0
-#         total_agreement = 0.0
-
-#         iterator = ii_dataloader
-#         if self.progress_bar:
-#             iterator = tqdm(
-#                 iterator,
-#                 total=len(ii_dataloader),
-#                 desc=f"Testing",
-#             )
-#         for (
-#             base_input,
-#             source_inputs,
-#             combined_activations,
-#             gold_outputs,
-#         ) in iterator:
-#             base_input = base_input.to(self.device)
-#             source_inputs = source_inputs.to(self.device)
-#             combined_activations = combined_activations.to(self.device)
-#             gold_outputs = gold_outputs.to(self.device)
-
-#             loss, agreements = self.dii_training_objective_and_agreement(
-#                 base_input,
-#                 source_inputs,
-#                 gold_outputs=gold_outputs,
-#                 combined_activations=combined_activations,
-#             )
-
-#             total_loss += loss.item()
-#             total_agreement += agreements.float().mean().item()
-
-#         loss = total_loss / len(ii_dataloader)
-#         accuracy = total_agreement / len(ii_dataloader)
-
-#         return loss, accuracy
+class TransformerVariableAlignment(VariableAlignment):
+    """A variable alignment between a recurrent DAG and a transformer
+
+    Parameters
+    ----------
+    dag : RecurrentDeterministicDAG
+        The DAG to align to the model
+    low_level_model : HookedTransformer
+        The hooked low-level model to align to the DAG
+    dag_nodes : list[str]
+        The names of the nodes (variables) of the DAG to align
+    input_alignment : callable
+        A function mapping (batches of) model input tensors to DAG input dictionaries
+    output_alignment : callable
+        A function mapping (batches of) model output tensors to DAG output values
+    intervene_model_hooks : list[str]
+        The names of the model hooks together give the whole activation space for
+        alignment the DAG nodes
+    subspaces_sizes : list[int]
+        The sizes of the subspaces to use for each DAG nodes
+    output_modifier : callable, optional
+        A function to modify the output of the low-level model before comparing it with
+        the DAG output
+    device : Union[str, torch.device], default=None
+        The device to put everything on. If None, use CUDA if available, otherwise CPU
+    verbosity : int, default=1
+        The verbosity level
+    progress_bar : bool, default=True
+        Whether to show a progress bar during and dataset generation
+    """
+
+    def _setup(self):
+        super()._setup()
+        self.d_vocab = self.low_level_model.cfg.d_vocab
+
+    def _determine_layer_sizes(self) -> list[int]:
+        """Run the model to determine the sizes of the activation spaces"""
+
+        if self.verbosity > 0:
+            print("Running model to determine activation space size...")
+
+        sizes = []
+
+        def counter_hook(value, hook: HookPoint, sizes):
+            sizes.append(value.shape[-1])
+
+        partial_counter_hook = partial(counter_hook, sizes=sizes)
+
+        x = torch.zeros(1, 1, device=self.device, dtype=torch.long)
+        fwd_hooks = [
+            (name, partial_counter_hook) for name in self.intervene_model_hooks
+        ]
+
+        self.low_level_model.run_with_hooks(x, fwd_hooks=fwd_hooks)
+
+        return sizes
+
+    def get_distributed_interchange_intervention_hooks(
+        self,
+        base_input: Float[Tensor, "batch_size seq_len"],
+        source_inputs: Float[Tensor, "batch_size num_nodes seq_len seq_len"],
+        combined_activations: Float[
+            Tensor, "batch_size 1+num_nodes*seq_len seq_len total_space_size"
+        ],
+    ) -> list[tuple[str, callable]]:
+        """Get hooks for distributed interchange intervention
+
+        Runs the model on the base input and each source input, and on input `i` records
+        the value of the projection of the rotated activation space onto the `i`th
+        subspace. It then builds hooks to patch in these values into the rotated
+        activation space.
+
+        Parameters
+        ----------
+        base_input : Float[Tensor, "batch_size seq_len"]
+            The base input to the model
+        source_inputs : Float[Tensor, "batch_size num_nodes seq_len seq_len"]
+            The source inputs to the model, one for each batch element, DAG node and
+            token position
+        combined_activations : Float[Tensor, "batch_size 1+num_nodes*seq_len seq_len,
+        total_space_size"]
+            The activations of the low-level model on the base input and source inputs,
+            combined
+
+        Returns
+        -------
+        list[tuple[str, callable]]
+            The hooks to use for distributed interchange intervention, for each of
+            `self.intervene_model_hooks`
+        """
+
+        if source_inputs.shape[-3] != self.num_nodes:
+            raise ValueError(
+                f"Expected {self.num_nodes} source inputs, got {source_inputs.shape[-3]}"
+            )
+
+        batch_size = base_input.shape[0]
+        seq_len = base_input.shape[1]
+
+        base_input = base_input.to(self.device)
+        source_inputs = source_inputs.to(self.device)
+
+        # (batch_size * (1 + num_nodes * seq_len), seq_len, total_space_size)
+        activation_values = combined_activations.view(
+            -1, seq_len, self.total_space_size
+        )
+
+        # (batch_size * (1 + num_nodes * seq_len), seq_len, total_space_size)
+        rotated_activation_values = self.rotation(activation_values)
+
+        # Select the rotated activation values which are relevant, for patching in. We
+        # select the indices of Y_0 for the base input across all positions at once, and
+        # select indices of each Y_i for each position, since we patch in for each tuple
+        # (node, stream) separately (these are dimensions 1 and 2 of `source_inputs`).
+        super_batch_indices = torch.empty(
+            (batch_size, seq_len, self.total_space_size), device=self.device, dtype=int
+        )
+        pos_indices = torch.arange(seq_len, device=self.device, dtype=int)
+        pos_indices = pos_indices.view(1, -1, 1)
+        space_indices = torch.arange(
+            self.total_space_size, device=self.device, dtype=int
+        )
+        space_indices = space_indices.view(1, 1, -1)
+
+        # Compute the indices for the super batch dimension (i.e. then batch_size * (1 +
+        # num_nodes * seq_len) one). Select Y_0 across all positions, and each Y_i
+        # for each position.
+        sub_batch_size = 1 + self.num_nodes * seq_len
+        super_batch_indices[:, :, : self.y_0_size] = (
+            torch.arange(batch_size).view(batch_size, 1, 1) * sub_batch_size
+        )
+        space_index = self.y_0_size
+        for i, subspace_size in enumerate(self.subspaces_sizes, start=1):
+            super_batch_indices[:, :, space_index : space_index + subspace_size] = (
+                torch.arange(batch_size).view(batch_size, 1, 1) * sub_batch_size
+                + (i - 1) * seq_len
+                + torch.arange(seq_len).view(1, seq_len, 1)
+            )
+            space_index += subspace_size
+
+        # (batch_size, seq_len, total_space_size)
+        new_rotated_activation_values = rotated_activation_values[
+            super_batch_indices, pos_indices, space_indices
+        ]
+
+        # Unrotate the new rotated activation values, to get a vector
+        # consisting of all the activation values to be patched in
+        # (batch_size, seq_len, total_space_size)
+        new_activation_values = self.rotation.inverse(new_rotated_activation_values)
+
+        def intervention_hook(
+            value,
+            hook: HookPoint,
+            space_index,
+            new_activation_values,
+        ):
+            value[:] = new_activation_values[
+                ..., space_index : space_index + value.shape[-1]
+            ]
+            return value
+
+        fwd_hooks = []
+        for i, name in enumerate(self.intervene_model_hooks):
+            fwd_hooks.append(
+                (
+                    name,
+                    partial(
+                        intervention_hook,
+                        space_index=sum(self.layer_sizes[:i]),
+                        new_activation_values=new_activation_values,
+                    ),
+                )
+            )
+
+        return fwd_hooks
+
+    def run_distributed_interchange_intervention(
+        self,
+        base_input: Float[Tensor, "batch_size seq_len"],
+        source_inputs: Float[Tensor, "batch_size num_nodes seq_len seq_len"],
+        combined_activations: Float[
+            Tensor, "batch_size 1+num_nodes*seq_len seq_len total_space_size"
+        ],
+    ) -> Float[Tensor, "batch_size seq_len ..."]:
+        """Compute the output of the low-level model on base and source inputs
+
+        Does distributed interchange intervention, patching in the activation values
+        from the source inputs, then running on the base input
+
+        **Warning**: This method will disable gradients for the model parameters,
+        setting `requires_grad` to `False`.
+
+        Parameters
+        ----------
+        base_input : Float[Tensor, "batch_size seq_len"]
+            The base input to the model
+        source_inputs : Float[Tensor, "batch_size num_nodes seq_len seq_len"]
+            The source inputs to the model
+        combined_activations : Float[Tensor, "batch_size 1+num_nodes*seq_len seq_len
+        total_space_size"]
+            The activations of the low-level model on the base input and source inputs,
+            combined
+
+        Returns
+        -------
+        output : Float[Tensor, "batch_size seq_len ..."]
+            The output of the low-level model (plus the output modifier, if set) on the
+            base input and source inputs
+        """
+
+        base_input = base_input.to(self.device)
+        source_inputs = source_inputs.to(self.device)
+
+        # Get the patches to apply
+        fwd_hooks = self.get_distributed_interchange_intervention_hooks(
+            base_input, source_inputs, combined_activations=combined_activations
+        )
+
+        # Run the model with the patches applied, disabling gradients for the
+        # model parameters, but not the rotation matrix used in the hooks
+        self.low_level_model.requires_grad_(False)
+        output = self.low_level_model.run_with_hooks(base_input, fwd_hooks=fwd_hooks)
+
+        if self.output_modifier is not None:
+            output = self.output_modifier(output)
+
+        return output
+
+    def run_interchange_intervention(
+        self,
+        base_input: Float[Tensor, "batch_size input_size"],
+        source_inputs: Float[Tensor, "batch_size num_nodes input_size"],
+        output_type: str = "output_nodes",
+    ) -> Float[Tensor, "batch_size"]:
+        """Run interchange intervention on the DAG
+
+        Parameters
+        ----------
+        base_input : Float[Tensor, "batch_size input_size"]
+            The base input to the model
+        source_inputs : Float[Tensor, "batch_size num_nodes input_size"]
+            The source inputs to the model
+        output_type : str, optional
+            The type of output to return, by default "output_nodes"
+
+        Returns
+        -------
+        dag_output : Float[Tensor, "batch_size"]
+            The output of the dag
+        """
+
+        # Convert the inputs into things the DAG can handle
+        base_input_dag = self.input_alignment(base_input)
+        source_inputs_dag = self.input_alignment(source_inputs)
+        intervention_mask = {}
+        for i, node in enumerate(self.dag_nodes):
+            intervention_mask[node] = torch.zeros(
+                (1, len(self.dag_nodes)), dtype=torch.bool
+            )
+            intervention_mask[node][0, i] = True
+
+        # Run interchange intervention
+        output = self.dag.run_interchange_intervention(
+            base_input_dag,
+            source_inputs_dag,
+            intervention_mask,
+            output_type=output_type,
+            return_integers=True,
+        )
+
+        # We assume that the DAG only has one output node. Return its value
+        output = list(output.values())[0].squeeze()
+        return output
+
+    def run_interchange_intervention(
+        self,
+        base_input: Float[Tensor, "batch_size seq_len"],
+        source_inputs: Float[Tensor, "batch_size num_nodes seq_len seq_len"],
+        output_type: str = "output_nodes",
+    ) -> Float[Tensor, "batch_size seq_len"]:
+        """Run interchange intervention on the DAG
+
+        Uses the vectorised runner if available.
+
+        Parameters
+        ----------
+        base_input : Float[Tensor, "batch_size seq_len"]
+            The base input to the model
+        source_inputs : Float[Tensor, "batch_size num_nodes seq_len seq_len"]
+            The source inputs to the model
+        output_type : str, optional
+            The type of output to return, by default "output_integer"
+
+        Returns
+        -------
+        dag_output : Float[Tensor, "batch_size seq_len"]
+            The output of the dag, as integers ranging over the possible
+            output values
+        """
+
+        batch_size = base_input.shape[0]
+        seq_len = base_input.shape[1]
+
+        # (batch_size, num_nodes * seq_len, seq_len)
+        source_inputs = source_inputs.view(batch_size, -1, seq_len)
+
+        # Convert the inputs into things the DAG can handle
+        base_input_dag = self.input_alignment(base_input)
+        source_inputs_dag = self.input_alignment(source_inputs)
+        intervention_mask = {}
+        for i, node in enumerate(self.dag_nodes):
+            intervention_mask[node] = torch.zeros(
+                (1, len(self.dag_nodes), seq_len), dtype=torch.bool
+            )
+            intervention_mask[node][
+                0, torch.arange(i * seq_len, (i + 1) * seq_len), torch.arange(seq_len)
+            ] = True
+
+        print("intervention_mask", intervention_mask)
+
+        # Run interchange intervention
+        output = self.dag.run_interchange_intervention(
+            base_input_dag,
+            source_inputs_dag,
+            intervention_mask,
+            output_type=output_type,
+            return_integers=True,
+        )
+
+        # We assume that the DAG only has one output node. Return its value
+        output = list(output.values())[0].squeeze()
+        return output
+
+    def dii_training_objective_and_agreement(
+        self,
+        base_input: Float[Tensor, "batch_size seq_len"],
+        source_inputs: Float[Tensor, "batch_size num_nodes seq_len seq_len"],
+        combined_activations: Float[
+            Tensor, "batch_size 1+num_nodes*seq_len seq_len total_space_size"
+        ],
+        gold_outputs: Float[Tensor, "batch_size seq_len"],
+        loss_fn: callable = F.cross_entropy,
+    ) -> tuple[Float[Tensor, ""], Float[Tensor, "batch_size seq_len"]]:
+        """Compute the training objective and accuracy of DII
+
+        Returns both the loss and a boolean for agreement between performing distributed
+        interchange intervention on the low-level model and interchange intervention on
+        the DAG.
+
+        Parameters
+        ----------
+        base_input : Float[Tensor, "batch_size seq_len"]
+            The base input to the model
+        source_inputs : Float[Tensor, "batch_size num_nodes seq_len seq_len"]
+            The source inputs to the model
+        combined_activations : Float[Tensor, "batch_size 1+num_nodes*seq_len seq_len
+        total_space_size"]
+            The activations of the low-level model on the base input and source inputs,
+            combined
+        gold_outputs : Float[Tensor, "batch_size seq_len"]
+            The gold outputs
+        loss_fn : callable, default=F.cross_entropy
+            The loss function to use
+
+        Returns
+        -------
+        loss : Float[Tensor, ""]
+            The training objective output
+        agreements : Float[Tensor, "batch_size seq_len"]
+            Whether the low-level model and the DAG agree on the output after doing
+            interventions
+        """
+
+        return super().dii_training_objective_and_agreement(
+            base_input=base_input,
+            source_inputs=source_inputs,
+            combined_activations=combined_activations,
+            gold_outputs=gold_outputs,
+            loss_fn=loss_fn,
+        )
+
+    def compute_activation_values(self, inputs: Tensor, batch_size=32) -> Tensor:
+        """Compute the activation vector for the given inputs
+
+        Parameters
+        ----------
+        inputs : Tensor of shape (num_inputs, seq_len)
+            The inputs to compute the activation vector for
+        batch_size : int, default=32
+            The batch size to use for running the model.
+
+        Returns
+        -------
+        activation_values : Tensor of shape (num_inputs, seq_len, total_space_size)
+            The activation vector for the given inputs
+        """
+
+        num_inputs = inputs.shape[0]
+        seq_len = inputs.shape[1]
+
+        activation_values = torch.empty(
+            (num_inputs, seq_len, self.total_space_size), dtype=torch.float32
+        )
+
+        def store_activation_value(
+            value, hook: HookPoint, activation_values, space_index, batch_start
+        ):
+            activation_values[
+                batch_start : batch_start + value.shape[0],
+                :,
+                space_index : space_index + value.shape[-1],
+            ] = value.to(activation_values.device)
+
+        # Hooks to store the activation values.
+        fwd_hooks = []
+        for i, name in enumerate(self.intervene_model_hooks):
+            fwd_hooks.append(
+                (
+                    name,
+                    partial(
+                        store_activation_value,
+                        activation_values=activation_values,
+                        space_index=sum(self.layer_sizes[:i]),
+                    ),
+                )
+            )
+
+        # Compute them in batches
+        iterator = range(0, num_inputs, batch_size)
+        if self.verbosity >= 1 and self.progress_bar:
+            iterator = tqdm(iterator, desc="Precomputing activation vectors")
+        with torch.no_grad():
+            for batch_start in iterator:
+                batch_fwd_hooks = []
+                for name, hook in fwd_hooks:
+                    batch_fwd_hooks.append(
+                        (name, partial(hook, batch_start=batch_start))
+                    )
+                batch_inputs = inputs[batch_start : batch_start + batch_size, ...]
+                batch_inputs = batch_inputs.to(self.device)
+                self.low_level_model.run_with_hooks(
+                    batch_inputs,
+                    fwd_hooks=batch_fwd_hooks,
+                )
+
+        return activation_values
+
+    def create_interchange_intervention_dataset(
+        self, inputs: Tensor, num_samples=10000, batch_size=32
+    ) -> TransformerInterchangeInterventionDataset:
+        """Create a dataset of interchange intervention
+
+        Samples `num_samples` instances of base and source inputs from `inputs`. Each
+        sample consists of a random subset of the DAG nodes and streams and random base
+        and source inputs. It always returns the same number of source inputs, filling
+        in for missing nodes with the base input.
+
+        Parameters
+        ----------
+        inputs : Tensor of shape (num_inputs, seq_len)
+            The inputs to sample from
+        num_samples : int, default=10000
+            The number of samples to take
+        batch_size : int, default=32
+            The batch size to use for running the low-level model.
+
+        Returns
+        -------
+        dataset : TransformerInterchangeInterventionDataset
+            A dataset of interchange intervention samples, which outputs the base
+            inputs, source inputs, the activation vectors on the combined base and
+            source inputs, and the gold (DAG) outputs
+        """
+
+        if self.verbosity >= 1:
+            print("Creating interchange intervention dataset...")
+
+        num_inputs = inputs.shape[0]
+        seq_len = inputs.shape[1]
+        num_nodes = self.num_nodes
+        device = inputs.device
+
+        activation_values = self.compute_activation_values(
+            inputs, batch_size=batch_size
+        )
+
+        # Set the number of DAG streams to be the same as the number of tokens (i.e.
+        # `seq_len`)
+        self.dag.num_streams = seq_len
+
+        # (num_samples, )
+        base_input_indices = torch.randint(0, num_inputs, (num_samples,))
+
+        # (num_samples, num_nodes, seq_len)
+        source_input_indices = torch.randint(
+            0, num_inputs, (num_samples, num_nodes, seq_len)
+        )
+
+        # (num_samples, num_nodes, seq_len)
+        node_stream_selected_mask = torch.randint(
+            0,
+            2,
+            (num_samples, num_nodes, seq_len),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        source_input_indices = torch.where(
+            node_stream_selected_mask,
+            source_input_indices,
+            base_input_indices.view(num_samples, 1, 1),
+        )
+
+        # (num_samples, seq_len)
+        base_inputs = inputs[base_input_indices]
+
+        # (num_samples, num_nodes, seq_len, seq_len)
+        source_inputs = inputs[source_input_indices]
+
+        gold_outputs = torch.empty((num_samples, seq_len), dtype=torch.long)
+
+        iterator = range(num_samples)
+        if self.verbosity >= 1 and self.progress_bar:
+            iterator = tqdm(iterator, desc="Computing gold outputs")
+        for i in iterator:
+            dag_output = self.run_interchange_intervention(
+                base_inputs[i], source_inputs[i], output_type="output_integer"
+            )
+            dag_output = dag_output[0]  # Assume there is only one output node. TODO
+            gold_outputs[i] = dag_output
+
+        return TransformerInterchangeInterventionDataset(
+            inputs=inputs,
+            activation_values=activation_values,
+            base_input_indices=base_input_indices,
+            source_input_indices=source_input_indices,
+            gold_outputs=gold_outputs,
+        )
+
+    def train_rotation_matrix(
+        self,
+        inputs: Optional[Float[Tensor, "num_inputs seq_len"]] = None,
+        ii_dataset: Optional[TransformerInterchangeInterventionDataset] = None,
+        num_epochs: int = 10,
+        lr: float = 0.01,
+        batch_size: int = 32,
+        num_samples: int = 10000,
+        shuffle: bool = True,
+    ) -> tuple[Float[np.ndarray, "num_epochs"], Float[np.ndarray, "num_epochs"]]:
+        """Train the rotation matrix to align the two models
+
+        Exactly one of `inputs` or `ii_dataset` must be provided. If `inputs`
+        is provided, it will be used to create an interchange intervention
+        dataset. If `ii_dataset` is provided, it will be used directly.
+
+        Parameters
+        ----------
+        inputs : Tensor of shape (num_inputs, seq_len), optional
+            The input on which to train the rotation matrix. Base and source
+            inputs will be samples from here
+        ii_dataset : TransformerInterchangeInterventionDataset, optional
+            The interchange intervention dataset to use
+        num_epochs : int, default=0
+            The number of epochs to train the rotation matrix for
+        lr : float, default=0.01
+            The learning rate to use
+        batch_size : int, default=32
+            The batch size to use
+        num_samples : int, default=10000
+            The number of samples to take from `inputs` to create the dataset,
+            if `inputs` is provided.
+        shuffle : bool, default=False
+            Whether to shuffle the dataset when training
+
+        Returns
+        -------
+        losses : np.ndarray of shape (num_epochs,)
+            The average loss at each epoch
+        accuracies : np.ndarray of shape (num_epochs,)
+            At each epoch the accuracy of the alignment between the low-level
+            model and the DAG
+        """
+
+        return super().train_rotation_matrix(
+            inputs=inputs,
+            ii_dataset=ii_dataset,
+            num_epochs=num_epochs,
+            lr=lr,
+            batch_size=batch_size,
+            num_samples=num_samples,
+            shuffle=shuffle,
+        )
+
+    @torch.no_grad()
+    def test_rotation_matrix(
+        self,
+        inputs: Optional[Tensor] = None,
+        ii_dataset: Optional[TensorDataset] = None,
+        batch_size: int = 32,
+        num_samples: int = 1000,
+    ) -> tuple[float, float]:
+        """Test the rotation matrix for alignment between the two models
+
+        Exactly one of `inputs` or `ii_dataset` must be provided. If `inputs` is
+        provided, it will be used to create an interchange intervention dataset. If
+        `ii_dataset` is provided, it will be used directly.
+
+        Parameters
+        ----------
+        inputs : Tensor of shape (num_inputs, seq_len), optional
+            The input on which to train the rotation matrix. Base and source inputs will
+            be samples from here
+        ii_dataset : TensorDataset, optional
+            The interchange intervention dataset to use
+        batch_size : int, default=32
+            The batch size to use
+        num_samples : int, default=1000
+            The number of samples to take from `inputs` to create the dataset, if
+            `inputs` is provided.
+
+        Returns
+        -------
+        loss : float
+            The average loss
+        accuracy : float
+            The accuracy of the alignment between the low-level model and the DAG
+        """
+
+        return super().test_rotation_matrix(
+            inputs=inputs,
+            ii_dataset=ii_dataset,
+            batch_size=batch_size,
+            num_samples=num_samples,
+        )

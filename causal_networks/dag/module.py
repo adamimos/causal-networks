@@ -56,7 +56,7 @@ class DAGModule(nn.Module, ABC):
         if hook_point is not None:
             self.value = hook_point(self.value)
         return self.value
-    
+
     def get_value_as_integer(self) -> torch.LongTensor:
         """Return the value of the node as integers, if possible"""
         raise NotImplementedError
@@ -87,7 +87,7 @@ class InputNode(DAGModule):
 
 class EqualityNode(DAGModule):
     """A node that checks if two inputs are equal
-    
+
     Parameters
     ----------
     dim : int, optional
@@ -123,15 +123,129 @@ class EqualityNode(DAGModule):
         if self.dim is not None:
             eqaulity_values = eqaulity_values.all(dim=self.dim, keepdim=self.keepdim)
         return eqaulity_values
-    
+
     def get_value_as_integer(self) -> torch.LongTensor:
-        """Return the value of the node as integers, if possible"""
         return self.value.long()
+
+
+class GreaterThanZeroNode(DAGModule):
+    """A node that checks if its parent is greater than zero"""
+
+    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.BoolTensor:
+        """Return a boolean tensor indicating where the parent value is > 0
+
+        Parameters
+        ----------
+        parent_values : dict[str, torch.Tensor]
+            The values of the parents of the node. There must be exactly one parent.
+
+        Returns
+        -------
+        value : torch.BoolTensor
+            A boolean tensor indicating where the parent is greater than 0
+        """
+        if len(parent_values) != 1:
+            raise ValueError("GreaterThanZeroNode must have exactly one parent")
+        values = list(parent_values.values())
+        return values[0] > 0
+
+    def get_value_as_integer(self) -> torch.LongTensor:
+        return self.value.long()
+
+
+class InSetNode(DAGModule):
+    """A node that checks if a value is in a set
+
+    Parameters
+    ----------
+    in_set : list | torch.Tensor
+        The set to check membership in
+    """
+
+    def __init__(self, in_set: list | torch.Tensor):
+        if isinstance(in_set, list):
+            in_set = torch.tensor(in_set)
+        super().__init__(in_set=list(in_set))
+        self.in_set = in_set
+
+    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.BoolTensor:
+        """Return a boolean tensor indicating where the parent value is in the set
+
+        Parameters
+        ----------
+        parent_values : dict[str, torch.Tensor]
+            The values of the parents of the node. There must be one parent.
+
+        Returns
+        -------
+        value : torch.BoolTensor
+            A boolean tensor indicating where the input is in the set
+        """
+        if len(parent_values) != 1:
+            raise ValueError("InSetNode must have exactly one parent")
+        values = list(parent_values.values())
+        return values[0].isin(self.in_set)
+
+    def get_value_as_integer(self) -> torch.LongTensor:
+        return self.value.long()
+
+
+class InSetOutSetNode(DAGModule):
+    """A node that outputs 1, 0 or -1 based on membership in two disjoint sets
+
+    Returns 1 if the value is in the `in_set`, -1 if it is in the `out_set`, and 0
+    otherwise.
+
+    Parameters
+    ----------
+    in_set : list | torch.Tensor
+        The set to check membership for positive values
+    out_set : list | torch.Tensor
+        The set to check membership for negative values. Must be disjoint from `in_set`
+    """
+
+    def __init__(self, in_set: list | torch.Tensor, out_set: list | torch.Tensor):
+        if isinstance(in_set, list):
+            in_set = torch.tensor(in_set)
+        if isinstance(out_set, list):
+            out_set = torch.tensor(out_set)
+
+        uniques, counts = torch.cat((in_set, out_set)).unique(return_counts=True)
+        if (counts > 1).any():
+            raise ValueError(
+                "InSetOutSetNode requires that the in_set and outset be disjoint"
+            )
+
+        super().__init__(in_set=in_set.tolist(), out_set=out_set.tolist())
+
+        self.in_set = in_set
+        self.out_set = out_set
+
+    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.LongTensor:
+        """Return 1, 0 or -1 based on membership in `in_set` and `out_set`
+
+        Parameters
+        ----------
+        parent_values : dict[str, torch.Tensor]
+            The values of the parents of the node. There must be one parent.
+
+        Returns
+        -------
+        value : torch.LongTensor
+            A boolean tensor indicating where the input is in the set
+        """
+        if len(parent_values) != 1:
+            raise ValueError("InSetNode must have exactly one parent")
+        values = list(parent_values.values())
+        return values[0].isin(self.in_set) - values[0].isin(self.out_set)
+
+    def get_value_as_integer(self) -> torch.LongTensor:
+        return self.value
 
 
 class CumSumNode(DAGModule):
     """A node that computes the cumulative sum of its parents
-    
+
     Parameters
     ----------
     dim : int, default=-1
@@ -159,7 +273,6 @@ class CumSumNode(DAGModule):
             raise ValueError("CumSumNode must have exactly one parent")
         values = list(parent_values.values())
         return torch.cumsum(values[0], dim=self.dim)
-    
+
     def get_value_as_integer(self) -> torch.LongTensor:
-        """Return the value of the node as integers, if possible"""
         return self.value.long()
