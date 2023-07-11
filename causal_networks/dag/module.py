@@ -202,6 +202,10 @@ class InSetNode(DAGModule):
 
     def get_value_as_integer(self) -> torch.LongTensor:
         return self.value.long()
+    
+    def to(self, *args, **kwargs):
+        self.in_set = self.in_set.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
 
 
 class InSetOutSetNode(DAGModule):
@@ -257,6 +261,11 @@ class InSetOutSetNode(DAGModule):
 
     def get_value_as_integer(self) -> torch.LongTensor:
         return self.value
+    
+    def to(self, *args, **kwargs):
+        self.in_set = self.in_set.to(*args, **kwargs)
+        self.out_set = self.out_set.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
 
 
 class CumSumNode(DAGModule):

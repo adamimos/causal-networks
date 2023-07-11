@@ -320,6 +320,7 @@ class VariableAlignment:
             )
 
         self.rotation = ParametrisedOrthogonalMatrix(self.total_space_size)
+        self.rotation = self.rotation.to(self.device)
 
     def _determine_layer_sizes(self) -> list[int]:
         """Run the model to determine the sizes of the activation spaces"""
@@ -521,7 +522,10 @@ class VariableAlignment:
         return output
 
     def compute_activation_values(
-        self, inputs: Float[Tensor, "num_inputs input_size"], batch_size=10000
+        self,
+        inputs: Float[Tensor, "num_inputs input_size"],
+        batch_size=10000,
+        activation_values_device: str | torch.device = "cpu",
     ) -> Float[Tensor, "num_inputs total_space_size"]:
         """Compute the activation vector for the given inputs
 
@@ -531,6 +535,8 @@ class VariableAlignment:
             The inputs to compute the activation vector for
         batch_size : int, default=10000
             The batch size to use for running the model.
+        activation_values_device : torch.device or str, default="cpu"
+            The device to store the activation values on
 
         Returns
         -------
@@ -551,7 +557,7 @@ class VariableAlignment:
         activation_values = torch.empty(
             num_inputs,
             self.total_space_size,
-            device=self.device,
+            device=activation_values_device,
         )
 
         # Hooks to store the activation values.
@@ -594,7 +600,11 @@ class VariableAlignment:
         return activation_values
 
     def create_interchange_intervention_dataset(
-        self, inputs: Tensor, num_samples=10000, dag_batch_size=10000
+        self,
+        inputs: Tensor,
+        num_samples=10000,
+        dag_batch_size=10000,
+        dataset_device: str | torch.device = "cpu",
     ) -> InterchangeInterventionDataset:
         """Create a dataset of interchange intervention
 
@@ -611,6 +621,8 @@ class VariableAlignment:
             The number of samples to take
         dag_batch_size : int, default=10000
             The batch size to use when running interchange intervention on the DAG
+        dataset_device : str or torch.device, default="cpu"
+            The device to put the dataset on.
 
         Returns
         -------
@@ -623,20 +635,28 @@ class VariableAlignment:
             print("Creating interchange intervention dataset...")
 
         num_inputs = inputs.shape[0]
-        input_size = inputs.shape[1]
         num_nodes = self.num_nodes
 
+        # Make sure the inputs are on the right device
+        inputs = inputs.to(dataset_device)
+
         # Compute the activation values for the inputs
-        activation_values = self.compute_activation_values(inputs)
+        activation_values = self.compute_activation_values(
+            inputs, activation_values_device=dataset_device
+        )
 
         # Sample the base and source inputs
-        base_input_indices = torch.randint(0, num_inputs, (num_samples,))
-        source_input_indices = torch.randint(0, num_inputs, (num_samples, num_nodes))
+        base_input_indices = torch.randint(
+            0, num_inputs, (num_samples,), device=dataset_device
+        )
+        source_input_indices = torch.randint(
+            0, num_inputs, (num_samples, num_nodes), device=dataset_device
+        )
 
         # Only intervene on some nodes with the source inputs; for the rest use the base
         # input
         node_selected_mask = torch.randint(
-            0, 2, (num_samples, num_nodes), dtype=torch.bool
+            0, 2, (num_samples, num_nodes), dtype=torch.bool, device=dataset_device
         )
         source_input_indices = torch.where(
             node_selected_mask,
@@ -647,17 +667,19 @@ class VariableAlignment:
         base_inputs = inputs[base_input_indices]
         source_inputs = inputs[source_input_indices]
 
-        gold_outputs = torch.empty((num_samples,), dtype=torch.long)
+        gold_outputs = torch.empty(
+            (num_samples,), dtype=torch.long, device=dataset_device
+        )
 
         iterator = range(0, num_samples, dag_batch_size)
         if self.verbosity >= 1 and self.progress_bar:
             iterator = tqdm(iterator, desc="Computing gold outputs")
         for batch_start in iterator:
             dag_output = self.run_interchange_intervention(
-                base_inputs[batch_start : batch_start + dag_batch_size],
-                source_inputs[batch_start : batch_start + dag_batch_size],
+                base_inputs[batch_start : batch_start + dag_batch_size].to(self.dag.device),
+                source_inputs[batch_start : batch_start + dag_batch_size].to(self.dag.device),
                 output_type="output_nodes",
-            )
+            ).to(dataset_device)
             gold_outputs[batch_start : batch_start + dag_batch_size] = dag_output
 
         return InterchangeInterventionDataset(
@@ -1155,6 +1177,8 @@ class TransformerVariableAlignment(VariableAlignment):
             output values
         """
 
+        device = base_input.device
+
         batch_size = base_input.shape[0]
         seq_len = base_input.shape[1]
 
@@ -1167,7 +1191,9 @@ class TransformerVariableAlignment(VariableAlignment):
         intervention_mask = {}
         for i, node in enumerate(self.dag_nodes):
             intervention_mask[node] = torch.zeros(
-                (1, len(self.dag_nodes) * seq_len, seq_len), dtype=torch.bool
+                (1, len(self.dag_nodes) * seq_len, seq_len),
+                dtype=torch.bool,
+                device=device,
             )
             intervention_mask[node][
                 0, torch.arange(i * seq_len, (i + 1) * seq_len), torch.arange(seq_len)
@@ -1234,7 +1260,12 @@ class TransformerVariableAlignment(VariableAlignment):
             loss_fn=loss_fn,
         )
 
-    def compute_activation_values(self, inputs: Tensor, batch_size=32) -> Tensor:
+    def compute_activation_values(
+        self,
+        inputs: Float[Tensor, "num_inputs seq_len"],
+        batch_size=32,
+        activation_values_device: str | torch.device = "cpu",
+    ) -> Float[Tensor, "num_inputs seq_len total_space_size"]:
         """Compute the activation vector for the given inputs
 
         Parameters
@@ -1243,6 +1274,8 @@ class TransformerVariableAlignment(VariableAlignment):
             The inputs to compute the activation vector for
         batch_size : int, default=32
             The batch size to use for running the model.
+        activation_values_device : torch.device or str, default="cpu"
+            The device to store the activation values on
 
         Returns
         -------
@@ -1254,7 +1287,9 @@ class TransformerVariableAlignment(VariableAlignment):
         seq_len = inputs.shape[1]
 
         activation_values = torch.empty(
-            (num_inputs, seq_len, self.total_space_size), dtype=torch.float32
+            (num_inputs, seq_len, self.total_space_size),
+            dtype=torch.float32,
+            device=activation_values_device,
         )
 
         def store_activation_value(
@@ -1306,6 +1341,7 @@ class TransformerVariableAlignment(VariableAlignment):
         num_samples=10000,
         batch_size=32,
         dag_batch_size=10000,
+        dataset_device: str | torch.device = "cpu",
     ) -> TransformerInterchangeInterventionDataset:
         """Create a dataset of interchange intervention
 
@@ -1324,6 +1360,8 @@ class TransformerVariableAlignment(VariableAlignment):
             The batch size to use for running the low-level model.
         dag_batch_size : int, default=10000
             The batch size to use when running interchange intervention on the DAG
+        dataset_device : str or torch.device, default="cpu"
+            The device to put the dataset on.
 
         Returns
         -------
@@ -1339,10 +1377,12 @@ class TransformerVariableAlignment(VariableAlignment):
         num_inputs = inputs.shape[0]
         seq_len = inputs.shape[1]
         num_nodes = self.num_nodes
-        device = inputs.device
+
+        # Make sure the inputs are on the right device
+        inputs = inputs.to(dataset_device)
 
         activation_values = self.compute_activation_values(
-            inputs, batch_size=batch_size
+            inputs, batch_size=batch_size, activation_values_device=dataset_device
         )
 
         # Set the number of DAG streams to be the same as the number of tokens (i.e.
@@ -1350,11 +1390,13 @@ class TransformerVariableAlignment(VariableAlignment):
         self.dag.num_streams = seq_len
 
         # (num_samples, )
-        base_input_indices = torch.randint(0, num_inputs, (num_samples,))
+        base_input_indices = torch.randint(
+            0, num_inputs, (num_samples,), device=dataset_device
+        )
 
         # (num_samples, num_nodes, seq_len)
         source_input_indices = torch.randint(
-            0, num_inputs, (num_samples, num_nodes, seq_len)
+            0, num_inputs, (num_samples, num_nodes, seq_len), device=dataset_device
         )
 
         # (num_samples, num_nodes, seq_len)
@@ -1363,7 +1405,7 @@ class TransformerVariableAlignment(VariableAlignment):
             2,
             (num_samples, num_nodes, seq_len),
             dtype=torch.bool,
-            device=device,
+            device=dataset_device,
         )
 
         source_input_indices = torch.where(
@@ -1378,17 +1420,23 @@ class TransformerVariableAlignment(VariableAlignment):
         # (num_samples, num_nodes, seq_len, seq_len)
         source_inputs = inputs[source_input_indices]
 
-        gold_outputs = torch.empty((num_samples, seq_len), dtype=torch.long)
+        gold_outputs = torch.empty(
+            (num_samples, seq_len), dtype=torch.long, device=dataset_device
+        )
 
         iterator = range(0, num_samples, dag_batch_size)
         if self.verbosity >= 1 and self.progress_bar:
             iterator = tqdm(iterator, desc="Computing gold outputs")
         for batch_start in iterator:
             dag_output = self.run_interchange_intervention(
-                base_inputs[batch_start : batch_start + dag_batch_size],
-                source_inputs[batch_start : batch_start + dag_batch_size],
+                base_inputs[batch_start : batch_start + dag_batch_size].to(
+                    self.dag.device
+                ),
+                source_inputs[batch_start : batch_start + dag_batch_size].to(
+                    self.dag.device
+                ),
                 output_type="output_nodes",
-            )
+            ).to(dataset_device)
             gold_outputs[batch_start : batch_start + dag_batch_size, :] = dag_output
 
         return TransformerInterchangeInterventionDataset(

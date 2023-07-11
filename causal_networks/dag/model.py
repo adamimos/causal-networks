@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from functools import partial
 
 import torch
@@ -29,6 +29,7 @@ class DAGModel(HookedRootModule):
         self.visualization_params = dict(
             layout=nx.kamada_kawai_layout, canvas_size=None, cmap_name="Pastel1"
         )
+        self.device = torch.device("cpu")
 
     def add_node(
         self,
@@ -400,3 +401,16 @@ class DAGModel(HookedRootModule):
                 table.add_row(*column_values)
             console = Console()
             console.print(table)
+
+    def to(self, device: Union[str, torch.device]):
+        """Move the model to a device
+
+        Parameters
+        ----------
+        device : str or torch.device
+            The device to move the model to
+        """
+        self.device = device
+        for node in self.graph.nodes:
+            self.graph.nodes[node]["module"].to(device)
+        return self
