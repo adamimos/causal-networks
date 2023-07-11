@@ -28,6 +28,10 @@ from transformer_lens import HookedTransformer
 from .dag import DAGModel
 
 
+def mean_cross_entropy(input, target):
+    return F.cross_entropy(input, target, reduction="mean")
+
+
 class ParametrisedOrthogonalMatrix(nn.Module):
     """A parametrised orthogonal matrix"""
 
@@ -190,7 +194,7 @@ class TransformerInterchangeInterventionDataset(InterchangeInterventionDataset):
         # For the following shapes we assume that idx is 1 dimensional
         if torch.is_tensor(idx):
             idx_ndim = idx.ndim
-        elif isinstance(idx, slice):
+        elif isinstance(idx, slice) or isinstance(idx, list):
             idx_ndim = 1
         else:
             idx_ndim = 0
@@ -243,14 +247,13 @@ class VariableAlignment:
     input_alignment : callable
         A function mapping (batches of) model input tensors to DAG input
         dictionaries
-    output_alignment : callable
-        A function mapping (batches of) model output tensors to DAG output
-        values
     intervene_model_hooks : list[str]
         The names of the model hooks together give the whole activation space
         for alignment the DAG nodes
     subspaces_sizes : list[int]
         The sizes of the subspaces to use for each DAG nodes
+    output_modifier : callable, default=None
+        A function to apply to the model outputs before computing the DII loss
     device : Union[str, torch.device], default=None
         The device to put everything on. If None, use CUDA if available,
         otherwise CPU
@@ -266,9 +269,9 @@ class VariableAlignment:
         low_level_model: HookedRootModule,
         dag_nodes: list[str],
         input_alignment: callable,
-        output_alignment: callable,
         intervene_model_hooks: list[str],
         subspaces_sizes: list[int],
+        output_modifier: Optional[callable] = None,
         device: Optional[Union[str, torch.device]] = None,
         verbosity: int = 1,
         progress_bar: bool = True,
@@ -291,9 +294,9 @@ class VariableAlignment:
         self.low_level_model = low_level_model
         self.dag_nodes = dag_nodes
         self.input_alignment = input_alignment
-        self.output_alignment = output_alignment
         self.intervene_model_hooks = intervene_model_hooks
         self.subspaces_sizes = subspaces_sizes
+        self.output_modifier = output_modifier
         self.device = device
         self.verbosity = verbosity
         self.progress_bar = progress_bar
@@ -456,9 +459,6 @@ class VariableAlignment:
             The output of the low-level model on the base input and source inputs
         """
 
-        base_input = base_input.to(self.device)
-        source_inputs = source_inputs.to(self.device)
-
         # Get the patches to apply
         fwd_hooks = self.get_distributed_interchange_intervention_hooks(
             base_input, source_inputs, combined_activations
@@ -468,6 +468,9 @@ class VariableAlignment:
         # model parameters, but not the rotation matrix used in the hooks
         self.low_level_model.requires_grad_(False)
         output = self.low_level_model.run_with_hooks(base_input, fwd_hooks=fwd_hooks)
+
+        if self.output_modifier is not None:
+            output = self.output_modifier(output)
 
         return output
 
@@ -646,7 +649,10 @@ class VariableAlignment:
 
         gold_outputs = torch.empty((num_samples,), dtype=torch.long)
 
-        for batch_start in range(0, num_samples, dag_batch_size):
+        iterator = range(0, num_samples, dag_batch_size)
+        if self.verbosity >= 1 and self.progress_bar:
+            iterator = tqdm(iterator, desc="Computing gold outputs")
+        for batch_start in iterator:
             dag_output = self.run_interchange_intervention(
                 base_inputs[batch_start : batch_start + dag_batch_size],
                 source_inputs[batch_start : batch_start + dag_batch_size],
@@ -703,10 +709,18 @@ class VariableAlignment:
             base_input, source_inputs, combined_activations
         )
 
+        # Permute the output so that the class dimension is second
+        permutation = (
+            [0]
+            + [output_low_level.ndim - 1]
+            + list(range(1, output_low_level.ndim - 1))
+        )
+        output_low_level = output_low_level.permute(*permutation)
+
         # Compute the loss
         loss = loss_fn(output_low_level, gold_outputs)
 
-        agreements = output_low_level.argmax(dim=-1) == gold_outputs
+        agreements = output_low_level.argmax(dim=1) == gold_outputs
 
         return loss, agreements
 
@@ -1111,69 +1125,9 @@ class TransformerVariableAlignment(VariableAlignment):
             base input and source inputs
         """
 
-        base_input = base_input.to(self.device)
-        source_inputs = source_inputs.to(self.device)
-
-        # Get the patches to apply
-        fwd_hooks = self.get_distributed_interchange_intervention_hooks(
-            base_input, source_inputs, combined_activations=combined_activations
+        return super().run_distributed_interchange_intervention(
+            base_input, source_inputs, combined_activations
         )
-
-        # Run the model with the patches applied, disabling gradients for the
-        # model parameters, but not the rotation matrix used in the hooks
-        self.low_level_model.requires_grad_(False)
-        output = self.low_level_model.run_with_hooks(base_input, fwd_hooks=fwd_hooks)
-
-        if self.output_modifier is not None:
-            output = self.output_modifier(output)
-
-        return output
-
-    def run_interchange_intervention(
-        self,
-        base_input: Float[Tensor, "batch_size input_size"],
-        source_inputs: Float[Tensor, "batch_size num_nodes input_size"],
-        output_type: str = "output_nodes",
-    ) -> Float[Tensor, "batch_size"]:
-        """Run interchange intervention on the DAG
-
-        Parameters
-        ----------
-        base_input : Float[Tensor, "batch_size input_size"]
-            The base input to the model
-        source_inputs : Float[Tensor, "batch_size num_nodes input_size"]
-            The source inputs to the model
-        output_type : str, optional
-            The type of output to return, by default "output_nodes"
-
-        Returns
-        -------
-        dag_output : Float[Tensor, "batch_size"]
-            The output of the dag
-        """
-
-        # Convert the inputs into things the DAG can handle
-        base_input_dag = self.input_alignment(base_input)
-        source_inputs_dag = self.input_alignment(source_inputs)
-        intervention_mask = {}
-        for i, node in enumerate(self.dag_nodes):
-            intervention_mask[node] = torch.zeros(
-                (1, len(self.dag_nodes)), dtype=torch.bool
-            )
-            intervention_mask[node][0, i] = True
-
-        # Run interchange intervention
-        output = self.dag.run_interchange_intervention(
-            base_input_dag,
-            source_inputs_dag,
-            intervention_mask,
-            output_type=output_type,
-            return_integers=True,
-        )
-
-        # We assume that the DAG only has one output node. Return its value
-        output = list(output.values())[0].squeeze()
-        return output
 
     def run_interchange_intervention(
         self,
@@ -1213,13 +1167,11 @@ class TransformerVariableAlignment(VariableAlignment):
         intervention_mask = {}
         for i, node in enumerate(self.dag_nodes):
             intervention_mask[node] = torch.zeros(
-                (1, len(self.dag_nodes), seq_len), dtype=torch.bool
+                (1, len(self.dag_nodes) * seq_len, seq_len), dtype=torch.bool
             )
             intervention_mask[node][
                 0, torch.arange(i * seq_len, (i + 1) * seq_len), torch.arange(seq_len)
             ] = True
-
-        print("intervention_mask", intervention_mask)
 
         # Run interchange intervention
         output = self.dag.run_interchange_intervention(
@@ -1349,7 +1301,11 @@ class TransformerVariableAlignment(VariableAlignment):
         return activation_values
 
     def create_interchange_intervention_dataset(
-        self, inputs: Tensor, num_samples=10000, batch_size=32
+        self,
+        inputs: Float[Tensor, "num_inputs seq_len"],
+        num_samples=10000,
+        batch_size=32,
+        dag_batch_size=10000,
     ) -> TransformerInterchangeInterventionDataset:
         """Create a dataset of interchange intervention
 
@@ -1360,12 +1316,14 @@ class TransformerVariableAlignment(VariableAlignment):
 
         Parameters
         ----------
-        inputs : Tensor of shape (num_inputs, seq_len)
+        inputs : Float[Tensor, "num_inputs seq_len"]
             The inputs to sample from
         num_samples : int, default=10000
             The number of samples to take
         batch_size : int, default=32
             The batch size to use for running the low-level model.
+        dag_batch_size : int, default=10000
+            The batch size to use when running interchange intervention on the DAG
 
         Returns
         -------
@@ -1422,15 +1380,16 @@ class TransformerVariableAlignment(VariableAlignment):
 
         gold_outputs = torch.empty((num_samples, seq_len), dtype=torch.long)
 
-        iterator = range(num_samples)
+        iterator = range(0, num_samples, dag_batch_size)
         if self.verbosity >= 1 and self.progress_bar:
             iterator = tqdm(iterator, desc="Computing gold outputs")
-        for i in iterator:
+        for batch_start in iterator:
             dag_output = self.run_interchange_intervention(
-                base_inputs[i], source_inputs[i], output_type="output_integer"
+                base_inputs[batch_start : batch_start + dag_batch_size],
+                source_inputs[batch_start : batch_start + dag_batch_size],
+                output_type="output_nodes",
             )
-            dag_output = dag_output[0]  # Assume there is only one output node. TODO
-            gold_outputs[i] = dag_output
+            gold_outputs[batch_start : batch_start + dag_batch_size, :] = dag_output
 
         return TransformerInterchangeInterventionDataset(
             inputs=inputs,
