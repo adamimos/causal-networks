@@ -60,6 +60,10 @@ class DAGModule(nn.Module, ABC):
     def get_value_as_integer(self) -> torch.LongTensor:
         """Return the value of the node as integers, if possible"""
         raise NotImplementedError
+    
+    def get_display_value(self) -> str:
+        """Return a human-readable representation of the value of the node"""
+        return str(self.value.tolist())
 
     def __repr__(self):
         init_kwargs_str = ", ".join(f"{k}={v!r}" for k, v in self._init_kwargs.items())
@@ -68,6 +72,10 @@ class DAGModule(nn.Module, ABC):
 
 class InputNode(DAGModule):
     """A node that takes an input value"""
+
+    def __init__(self, display_value_converter: Optional[callable] = None):
+        super().__init__()
+        self.display_value_converter = display_value_converter
 
     def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.Tensor:
         """Return the value of the node
@@ -83,6 +91,12 @@ class InputNode(DAGModule):
             The value of the node
         """
         return self.value
+    
+    def get_display_value(self) -> str:
+        if self.display_value_converter is not None:
+            return self.display_value_converter(self.value)
+        else:
+            return super().get_display_value()
 
 
 class EqualityNode(DAGModule):
@@ -184,7 +198,7 @@ class InSetNode(DAGModule):
         if len(parent_values) != 1:
             raise ValueError("InSetNode must have exactly one parent")
         values = list(parent_values.values())
-        return values[0].isin(self.in_set)
+        return torch.isin(values[0], self.in_set)
 
     def get_value_as_integer(self) -> torch.LongTensor:
         return self.value.long()
@@ -237,7 +251,9 @@ class InSetOutSetNode(DAGModule):
         if len(parent_values) != 1:
             raise ValueError("InSetNode must have exactly one parent")
         values = list(parent_values.values())
-        return values[0].isin(self.in_set) - values[0].isin(self.out_set)
+        isin_in_set = torch.isin(values[0], self.in_set).long()
+        isin_out_set = torch.isin(values[0], self.out_set).long()
+        return isin_in_set - isin_out_set
 
     def get_value_as_integer(self) -> torch.LongTensor:
         return self.value

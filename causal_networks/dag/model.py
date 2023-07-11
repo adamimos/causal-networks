@@ -2,6 +2,9 @@ from typing import Any, Optional
 from functools import partial
 
 import torch
+from torch import Tensor
+
+from jaxtyping import Float, Bool
 
 import networkx as nx
 
@@ -23,7 +26,9 @@ class DAGModel(HookedRootModule):
     def __init__(self):
         super().__init__()
         self.graph = nx.DiGraph()
-        self.visualization_layout = None
+        self.visualization_params = dict(
+            layout=nx.kamada_kawai_layout, canvas_size=None, cmap_name="Pastel1"
+        )
 
     def add_node(
         self,
@@ -70,15 +75,35 @@ class DAGModel(HookedRootModule):
             )
         self.graph.add_edge(node1, node2)
 
-    def get_node_value(self, node: str) -> torch.Tensor:
+    def get_node_value(self, node: str) -> Tensor:
         """Get the value of a node
 
         Parameters
         ----------
         node : str
             The name of the node
+
+        Returns
+        -------
+        value : Tensor
+            The value of the node
         """
         return self.graph.nodes[node]["module"].value
+
+    def get_node_display_value(self, node: str) -> str:
+        """Get a human-readable representation of the value of a node
+
+        Parameters
+        ----------
+        node : str
+            The name of the node
+
+        Returns
+        -------
+        display_value : str
+            A human-readable representation of the value of the node
+        """
+        return self.graph.nodes[node]["module"].get_display_value()
 
     def get_input_nodes(self) -> list[str]:
         """Get the input nodes
@@ -102,15 +127,15 @@ class DAGModel(HookedRootModule):
 
     def forward(
         self,
-        inputs: dict[str, torch.Tensor],
+        inputs: dict[str, Tensor],
         output_type="output_nodes",
         return_integers=False,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Tensor]:
         """Forward pass through the DAG
 
         Parameters
         ----------
-        inputs : dict[str, torch.Tensor]
+        inputs : dict[str, Tensor]
             The input values for the input nodes. The values can be batched.
         output_type : str, default="output_nodes"
             The type of output to return. Can be one of:
@@ -123,7 +148,7 @@ class DAGModel(HookedRootModule):
 
         Returns
         -------
-        outputs : dict[str, torch.Tensor]
+        outputs : dict[str, Tensor]
             The values for the output nodes. Batched in the same way as the inputs.
         """
 
@@ -173,12 +198,12 @@ class DAGModel(HookedRootModule):
 
     def run_interchange_intervention(
         self,
-        base_input: dict[str, torch.Tensor],
-        source_inputs: dict[str, torch.Tensor],
-        intervention_mask: dict[str, torch.BoolTensor],
+        base_input: dict[str, Float[Tensor, "batch_size ..."]],
+        source_inputs: dict[str, Float[Tensor, "batch_size num_source_inputs ..."]],
+        intervention_mask: dict[str, Bool[Tensor, "batch_size num_source_inputs ..."]],
         output_type="output_nodes",
         return_integers=False,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Tensor]:
         """Run interchange intervention with base and source inputs
 
         Runs the forward pass with the source inputs, recording the values of the nodes.
@@ -193,9 +218,9 @@ class DAGModel(HookedRootModule):
 
         Parameters
         ----------
-        base_input : dict[str, torch.Tensor of shape (batch_size, ...)]
+        base_input : dict[str, Tensor of shape (batch_size, ...)]
             The base input values for the input nodes
-        source_inputs : dict[str, torch.Tensor of shape (batch_size, num_source_inputs,
+        source_inputs : dict[str, Tensor of shape (batch_size, num_source_inputs,
         ...)]
             The source input values for the input nodes
         intervention_mask : dict[str, torch.BoolTensor of shape (batch_size,
@@ -217,7 +242,7 @@ class DAGModel(HookedRootModule):
 
         Returns
         -------
-        outputs : dict[str, torch.Tensor of shape (batch_size, ...)]
+        outputs : dict[str, Tensor of shape (batch_size, ...)]
             The values for the nodes. Batched in the same way as the inputs.
         """
 
@@ -226,11 +251,11 @@ class DAGModel(HookedRootModule):
         # An intervention hook which replaces the value with the source value according
         # to the intervention mask
         def intervention_hook(
-            value: torch.Tensor,
+            value: Tensor,
             hook: HookPoint,
             node: str,
-            source_values: dict[str, torch.Tensor],
-            intervention_mask: dict[str, torch.Tensor],
+            source_values: dict[str, Tensor],
+            intervention_mask: dict[str, Tensor],
         ):
             # If the node is not in the intervention mask, don't intervene
             if node not in intervention_mask:
@@ -280,57 +305,81 @@ class DAGModel(HookedRootModule):
 
         return output
 
-    def set_visualization_layout(self, layout_function: Optional[callable]):
-        """Set the layout function for visualizing the DAG
+    def set_visualization_params(
+        self,
+        layout: Optional[callable] = None,
+        canvas_size: Optional[tuple[int, int]] = None,
+        cmap_name: Optional[str] = None,
+    ):
+        """Set parameters for visualizing the DAG
 
         Parameters
         ----------
-        layout_function : callable
-            The layout function to use for drawing the graph. It is recommended to use
-            a function from `networkx.drawing.layout` (possibly wrapped in a partial).
+        layout : callable, optional
+            The layout function to use for drawing the graph. It is recommended to use a
+            function from `networkx.drawing.layout` (possibly wrapped in a partial). By
+            default uses the Kamada-Kawai path-length cost-function
+        canvas_size : tuple[int, int], optional
+            The size of the canvas to draw the graph on. By default uses the default
+            networkx canvas size.
+        cmap_name : str, optional
+            The name of the colormap to use for the node colors. By default uses
+            "pastel1".
         """
-        self.visualization_layout = layout_function
+        if layout is not None:
+            self.visualization_params["layout"] = layout
+        if canvas_size is not None:
+            self.visualization_params["canvas_size"] = canvas_size
+        if cmap_name is not None:
+            self.visualization_params["cmap_name"] = cmap_name
 
     def visualize(
         self,
-        display_node_info=True,
+        display_node_table=True,
         display_node_values=False,
-        layout: Optional[callable] = None,
-        cmap_name="Pastel1",
+        use_human_readable_values=True,
+        visualization_params: Optional[dict] = None,
     ):
         """Draw a visualization of the DAG
 
+        Uses
+
         Parameters
         ----------
-        display_node_info : bool, default=True
+        display_node_table : bool, default=True
             Whether to display information about the nodes in a table
         display_node_values : bool, default=False
             Whether to display the values of the nodes in the table
-        layout : callable, optional
-            The layout function to use for drawing the graph. If None, uses the
-            `visulaization_layout` attribute if available, otherwise uses the
-            Kamada-Kawai path-length cost-function
-        cmap_name : str, default="Pastel1"
-            The name of the colormap to use
+        use_human_readable_values : bool, default=True
+            Whether to use human-readable values for the nodes. If False, uses the raw
+            values.
+        visualization_params : dict, optional
+            Parameters used to control the visualization. If None, uses the values of
+            `self.visualization_params`. See `self.set_visualization_params` for
+            details.
         """
 
-        cmap = colormaps[cmap_name]
+        if visualization_params is None:
+            visualization_params = self.visualization_params
+        else:
+            for param, value in self.visualization_params.items():
+                if param not in visualization_params:
+                    visualization_params[param] = value
 
-        if layout is None:
-            if self.visualization_layout is not None:
-                layout = self.visualization_layout
-            else:
-                layout = nx.kamada_kawai_layout
+        cmap = colormaps[visualization_params["cmap_name"]]
 
+        plt.figure(figsize=visualization_params["canvas_size"])
+        ax = plt.gca()
         nx.draw(
             self.graph,
-            pos=layout(self.graph),
+            pos=visualization_params["layout"](self.graph),
+            ax=ax,
             with_labels=True,
             node_color=[cmap(1)] * len(self.graph.nodes),
         )
         plt.show()
 
-        if display_node_info:
+        if display_node_table:
             table = Table(
                 title="Node Information", show_header=True, header_style="bold"
             )
@@ -342,7 +391,10 @@ class DAGModel(HookedRootModule):
                 column_values = [node, str(self.graph.nodes[node]["module"])]
                 if display_node_values:
                     if self.get_node_value(node) is not None:
-                        column_values.append(str(self.get_node_value(node)))
+                        if use_human_readable_values:
+                            column_values.append(self.get_node_display_value(node))
+                        else:
+                            column_values.append(str(self.get_node_value(node)))
                     else:
                         column_values.append("-")
                 table.add_row(*column_values)
