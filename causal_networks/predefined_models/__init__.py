@@ -1,2 +1,1 @@
 from .parenthesis_balancing import make_basic_pb_dag
-from .hierarchical_equality import make_hier_equal_dag_and_variable_alignment
