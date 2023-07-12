@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch import Tensor, BoolTensor, LongTensor
 
 from transformer_lens.hook_points import HookPoint
 
@@ -16,24 +17,24 @@ class DAGModule(nn.Module, ABC):
         self.value = None
 
     @abstractmethod
-    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_value(self, parent_values: dict[str, Tensor]) -> Tensor:
         """Compute the value of the node based on the values of its parents
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node
 
         Returns
         -------
-        value : torch.Tensor
+        value : Tensor
             The value of the node
         """
         pass
 
     def forward(
-        self, parent_values: dict[str, torch.Tensor], hook_point: Optional[HookPoint]
-    ) -> torch.Tensor:
+        self, parent_values: dict[str, Tensor], hook_point: Optional[HookPoint]
+    ) -> Tensor:
         """Do a forward pass through the module
 
         Uses the `compute_value` method to compute the value of the node based on the
@@ -42,14 +43,14 @@ class DAGModule(nn.Module, ABC):
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node
         hook_point : HookPoint, optional
             A hook point to pass the value through, by default None
 
         Returns
         -------
-        value : torch.Tensor
+        value : Tensor
             The value of the node
         """
         self.value = self.compute_value(parent_values)
@@ -57,7 +58,7 @@ class DAGModule(nn.Module, ABC):
             self.value = hook_point(self.value)
         return self.value
 
-    def get_value_as_integer(self) -> torch.LongTensor:
+    def get_value_as_integer(self) -> LongTensor:
         """Return the value of the node as integers, if possible"""
         raise NotImplementedError
     
@@ -77,17 +78,17 @@ class InputNode(DAGModule):
         super().__init__()
         self.display_value_converter = display_value_converter
 
-    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_value(self, parent_values: dict[str, Tensor]) -> Tensor:
         """Return the value of the node
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node (ignored)
 
         Returns
         -------
-        value : torch.Tensor
+        value : Tensor
             The value of the node
         """
         return self.value
@@ -117,17 +118,17 @@ class EqualityNode(DAGModule):
         self.dim = dim
         self.keepdim = keepdim
 
-    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.BoolTensor:
+    def compute_value(self, parent_values: dict[str, Tensor]) -> BoolTensor:
         """Return a boolean tensor indicating where the two parent values are equal
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node. There must be two parents.
 
         Returns
         -------
-        value : torch.BoolTensor
+        value : BoolTensor
             A boolean tensor indicating where the two inputs are equal
         """
         if len(parent_values) != 2:
@@ -138,24 +139,73 @@ class EqualityNode(DAGModule):
             eqaulity_values = eqaulity_values.all(dim=self.dim, keepdim=self.keepdim)
         return eqaulity_values
 
-    def get_value_as_integer(self) -> torch.LongTensor:
+    def get_value_as_integer(self) -> LongTensor:
+        return self.value.long()
+
+
+class NotNode(DAGModule):
+    """A node that does a logical NOT of its parent"""
+    
+    def compute_value(self, parent_values: dict[str, Tensor]) -> Tensor:
+        """Return a boolean tensor with the logical NOT of the parent value
+
+        Parameters
+        ----------
+        parent_values : dict[str, Tensor]
+            The values of the parents of the node. There must be exactly one parent.
+
+        Returns
+        -------
+        value : Tensor
+            A boolean tensor with the logical NOT of the parent value
+        """
+        if len(parent_values) != 1:
+            raise ValueError("NotNode must have exactly one parent")
+        return ~list(parent_values.values())[0]
+
+    def get_value_as_integer(self) -> LongTensor:
+        return self.value.long()
+
+
+class AndNode(DAGModule):
+    """A node the does a logical AND of its parents"""
+
+    def compute_value(self, parent_values: dict[str, Tensor]) -> Tensor:
+        """Return a boolean tensor with the logical AND of the parent values
+        
+        Parameters
+        ----------
+        parent_values : dict[str, Tensor]
+            The values of the parents of the node. There must be two parents.
+        
+        Returns
+        -------
+        value : Tensor
+            A boolean tensor with the logical AND of the parent values
+        """
+        if len(parent_values) != 2:
+            raise ValueError("AndNode must have exactly two parents")
+        values = list(parent_values.values())
+        return values[0] & values[1]
+
+    def get_value_as_integer(self) -> LongTensor:
         return self.value.long()
 
 
 class GreaterThanZeroNode(DAGModule):
     """A node that checks if its parent is greater than zero"""
 
-    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.BoolTensor:
+    def compute_value(self, parent_values: dict[str, Tensor]) -> BoolTensor:
         """Return a boolean tensor indicating where the parent value is > 0
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node. There must be exactly one parent.
 
         Returns
         -------
-        value : torch.BoolTensor
+        value : BoolTensor
             A boolean tensor indicating where the parent is greater than 0
         """
         if len(parent_values) != 1:
@@ -163,7 +213,7 @@ class GreaterThanZeroNode(DAGModule):
         values = list(parent_values.values())
         return values[0] > 0
 
-    def get_value_as_integer(self) -> torch.LongTensor:
+    def get_value_as_integer(self) -> LongTensor:
         return self.value.long()
 
 
@@ -172,27 +222,27 @@ class InSetNode(DAGModule):
 
     Parameters
     ----------
-    in_set : list | torch.Tensor
+    in_set : list | Tensor
         The set to check membership in
     """
 
-    def __init__(self, in_set: list | torch.Tensor):
+    def __init__(self, in_set: list | Tensor):
         if isinstance(in_set, list):
             in_set = torch.tensor(in_set)
-        super().__init__(in_set=list(in_set))
+        super().__init__(in_set=in_set.tolist())
         self.in_set = in_set
 
-    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.BoolTensor:
+    def compute_value(self, parent_values: dict[str, Tensor]) -> BoolTensor:
         """Return a boolean tensor indicating where the parent value is in the set
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node. There must be one parent.
 
         Returns
         -------
-        value : torch.BoolTensor
+        value : BoolTensor
             A boolean tensor indicating where the input is in the set
         """
         if len(parent_values) != 1:
@@ -200,7 +250,7 @@ class InSetNode(DAGModule):
         values = list(parent_values.values())
         return torch.isin(values[0], self.in_set)
 
-    def get_value_as_integer(self) -> torch.LongTensor:
+    def get_value_as_integer(self) -> LongTensor:
         return self.value.long()
     
     def to(self, *args, **kwargs):
@@ -216,13 +266,13 @@ class InSetOutSetNode(DAGModule):
 
     Parameters
     ----------
-    in_set : list | torch.Tensor
+    in_set : list | Tensor
         The set to check membership for positive values
-    out_set : list | torch.Tensor
+    out_set : list | Tensor
         The set to check membership for negative values. Must be disjoint from `in_set`
     """
 
-    def __init__(self, in_set: list | torch.Tensor, out_set: list | torch.Tensor):
+    def __init__(self, in_set: list | Tensor, out_set: list | Tensor):
         if isinstance(in_set, list):
             in_set = torch.tensor(in_set)
         if isinstance(out_set, list):
@@ -239,17 +289,17 @@ class InSetOutSetNode(DAGModule):
         self.in_set = in_set
         self.out_set = out_set
 
-    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.LongTensor:
+    def compute_value(self, parent_values: dict[str, Tensor]) -> LongTensor:
         """Return 1, 0 or -1 based on membership in `in_set` and `out_set`
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node. There must be one parent.
 
         Returns
         -------
-        value : torch.LongTensor
+        value : LongTensor
             A boolean tensor indicating where the input is in the set
         """
         if len(parent_values) != 1:
@@ -259,7 +309,7 @@ class InSetOutSetNode(DAGModule):
         isin_out_set = torch.isin(values[0], self.out_set).long()
         return isin_in_set - isin_out_set
 
-    def get_value_as_integer(self) -> torch.LongTensor:
+    def get_value_as_integer(self) -> LongTensor:
         return self.value
     
     def to(self, *args, **kwargs):
@@ -281,17 +331,17 @@ class CumSumNode(DAGModule):
         super().__init__(dim=dim)
         self.dim = dim
 
-    def compute_value(self, parent_values: dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_value(self, parent_values: dict[str, Tensor]) -> Tensor:
         """Compute the cumulative sum of the input
 
         Parameters
         ----------
-        parent_values : dict[str, torch.Tensor]
+        parent_values : dict[str, Tensor]
             The values of the parents of the node. There must be one parent.
 
         Returns
         -------
-        value : torch.Tensor
+        value : Tensor
             The cumulative sum of the input
         """
         if len(parent_values) != 1:
@@ -299,5 +349,5 @@ class CumSumNode(DAGModule):
         values = list(parent_values.values())
         return torch.cumsum(values[0], dim=self.dim)
 
-    def get_value_as_integer(self) -> torch.LongTensor:
+    def get_value_as_integer(self) -> LongTensor:
         return self.value.long()

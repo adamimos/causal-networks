@@ -11,7 +11,10 @@ from transformer_lens.utils import to_numpy
 from ..dag import (
     DAGModel,
     InputNode,
+    NotNode,
+    AndNode,
     GreaterThanZeroNode,
+    InSetNode,
     InSetOutSetNode,
     CumSumNode,
 )
@@ -82,6 +85,60 @@ def make_basic_pb_dag(model: HookedTransformer, device: str | torch.device = "cp
     dag.add_edge("s", "c")
 
     dag.set_visualization_params(layout=vis_layout, canvas_size=(3, 1))
+
+    dag.to(device)
+
+    return dag
+
+
+def make_suppressing_pb_dag(
+    model: HookedTransformer, device: str | torch.device = "cpu"
+):
+    """Cumsum DAG with suppressing tokens for parenthesis balancing"""
+
+    open_paren_tokens, closed_paren_tokens, suppressing_tokens = _get_important_tokens(
+        model
+    )
+
+    def vis_layout(*args, **kwargs):
+        return {
+            "input": (1, 4),
+            "bracket": (0, 3),
+            "sum": (0, 2),
+            "gt0": (0, 1),
+            "supp": (2, 3),
+            "not": (2, 1),
+            "and": (1, 0),
+        }
+
+    dag = DAGModel()
+
+    dag.add_node(
+        "input",
+        InputNode(
+            display_value_converter=partial(input_display_value_converter, model=model)
+        ),
+    )
+    dag.add_node("bracket", InSetOutSetNode(open_paren_tokens, closed_paren_tokens))
+    dag.add_node("sum", CumSumNode())
+    dag.add_node("gt0", GreaterThanZeroNode())
+    dag.add_node("supp", InSetNode(suppressing_tokens))
+    dag.add_node("not", NotNode())
+    dag.add_node("and", AndNode())
+
+    dag.add_edge("input", "bracket")
+    dag.add_edge("bracket", "sum")
+    dag.add_edge("sum", "gt0")
+    dag.add_edge("gt0", "and")
+    dag.add_edge("input", "supp")
+    dag.add_edge("supp", "not")
+    dag.add_edge("not", "and")
+
+    dag.set_visualization_params(
+        layout=vis_layout,
+        canvas_size=(5, 4),
+        draw_kwargs=dict(node_size=1000, node_shape="o"),
+    )
 
     dag.to(device)
 

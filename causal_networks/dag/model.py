@@ -27,7 +27,10 @@ class DAGModel(HookedRootModule):
         super().__init__()
         self.graph = nx.DiGraph()
         self.visualization_params = dict(
-            layout=nx.kamada_kawai_layout, canvas_size=None, cmap_name="Pastel1"
+            layout=nx.kamada_kawai_layout,
+            canvas_size=None,
+            cmap_name="Pastel1",
+            draw_kwargs=dict(),
         )
         self.device = torch.device("cpu")
 
@@ -128,7 +131,8 @@ class DAGModel(HookedRootModule):
 
     def forward(
         self,
-        inputs: dict[str, Tensor],
+        inputs: dict[str, Tensor] | Tensor,
+        input_type: str = "input_nodes",
         output_type="output_nodes",
         return_integers=False,
     ) -> dict[str, Tensor]:
@@ -138,9 +142,15 @@ class DAGModel(HookedRootModule):
         ----------
         inputs : dict[str, Tensor]
             The input values for the input nodes. The values can be batched.
+        input_type : str, default="input_nodes"
+            The type of input. Can be one of:
+                - "input_nodes": a dictionary with only the input nodes
+                - "single_input": a single tensor used as the input for all input nodes
         output_type : str, default="output_nodes"
             The type of output to return. Can be one of:
-                - "output_nodes": only the output nodes
+                - "output_nodes": a dictionary with only the output nodes
+                - "single_output": assume there is only one output node and return its
+                    value
                 - "all_nodes": all node values
         return_integers : bool, default=False
             Whether to return the values as integers. If True, the values are converted
@@ -149,7 +159,7 @@ class DAGModel(HookedRootModule):
 
         Returns
         -------
-        outputs : dict[str, Tensor]
+        outputs : dict[str, Tensor] | Tensor
             The values for the output nodes. Batched in the same way as the inputs.
         """
 
@@ -157,9 +167,15 @@ class DAGModel(HookedRootModule):
         for node in nx.topological_sort(self.graph):
             # For input nodes, take the value from `inputs`
             if self.graph.in_degree(node) == 0:
-                if node not in inputs:
-                    raise ValueError(f"Missing input for node {node}")
-                self.graph.nodes[node]["module"].value = inputs[node]
+                if input_type == "input_nodes":
+                    if node not in inputs:
+                        raise ValueError(f"Missing input for node {node}")
+                    value = inputs[node]
+                elif input_type == "single_input":
+                    value = inputs
+                else:
+                    raise ValueError(f"Unknown input type {input_type}")
+                self.graph.nodes[node]["module"].value = value
 
             # For other nodes, compute the value based on the value of the parents
             else:
@@ -173,7 +189,7 @@ class DAGModel(HookedRootModule):
                 )
 
         # Determine the requested output nodes
-        if output_type == "output_nodes":
+        if output_type == "output_nodes" or output_type == "single_output":
             requested_nodes = self.get_output_nodes()
         elif output_type == "all_nodes":
             requested_nodes = self.graph.nodes
@@ -191,11 +207,18 @@ class DAGModel(HookedRootModule):
                     raise RuntimeError(
                         f"Cannot convert value of node {node} to integer"
                     )
-            return requested_values
+            if output_type == "single_output":
+                return list(requested_values.values())[0]
+            else:
+                return requested_values
         else:
-            return {
-                node: self.graph.nodes[node]["module"].value for node in requested_nodes
-            }
+            requested_values = {}
+            for node in requested_nodes:
+                requested_values[node] = self.graph.nodes[node]["module"].value
+            if output_type == "single_output":
+                return list(requested_values.values())[0]
+            else:
+                return requested_values
 
     def run_interchange_intervention(
         self,
@@ -311,6 +334,7 @@ class DAGModel(HookedRootModule):
         layout: Optional[callable] = None,
         canvas_size: Optional[tuple[int, int]] = None,
         cmap_name: Optional[str] = None,
+        draw_kwargs: Optional[dict] = None,
     ):
         """Set parameters for visualizing the DAG
 
@@ -326,6 +350,8 @@ class DAGModel(HookedRootModule):
         cmap_name : str, optional
             The name of the colormap to use for the node colors. By default uses
             "pastel1".
+        draw_kwargs : dict, optional
+            Additional keyword arguments to pass to `networkx.draw_networkx`
         """
         if layout is not None:
             self.visualization_params["layout"] = layout
@@ -333,6 +359,8 @@ class DAGModel(HookedRootModule):
             self.visualization_params["canvas_size"] = canvas_size
         if cmap_name is not None:
             self.visualization_params["cmap_name"] = cmap_name
+        if draw_kwargs is not None:
+            self.visualization_params["draw_kwargs"] = draw_kwargs
 
     def visualize(
         self,
@@ -377,6 +405,7 @@ class DAGModel(HookedRootModule):
             ax=ax,
             with_labels=True,
             node_color=[cmap(1)] * len(self.graph.nodes),
+            **visualization_params["draw_kwargs"],
         )
         plt.show()
 
