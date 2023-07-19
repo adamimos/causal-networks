@@ -18,7 +18,7 @@ from torch.nn.utils.parametrizations import orthogonal
 
 import einops
 
-from jaxtyping import Float
+from jaxtyping import Float, Bool
 
 import numpy as np
 
@@ -167,6 +167,9 @@ class TransformerInterchangeInterventionDataset(InterchangeInterventionDataset):
         The indices of the source inputs to use
     gold_outputs : Float[Tensor, "num_samples seq_len"]
         The gold outputs for the base and source inputs
+    loss_mask : Bool[Tensor, "num_samples seq_len"], optional
+        A mask to apply to the inputs to indicate which positions should be used for
+        computing the loss. If None, all positions are used.
     """
 
     def __init__(
@@ -176,6 +179,7 @@ class TransformerInterchangeInterventionDataset(InterchangeInterventionDataset):
         base_input_indices: Float[Tensor, "num_samples"],
         source_input_indices: Float[Tensor, "num_samples num_nodes seq_len"],
         gold_outputs: Float[Tensor, "num_samples seq_len"],
+        loss_mask: Optional[Bool[Tensor, "num_samples seq_len"]] = None,
     ):
         super().__init__(
             inputs=inputs,
@@ -184,6 +188,9 @@ class TransformerInterchangeInterventionDataset(InterchangeInterventionDataset):
             source_input_indices=source_input_indices,
             gold_outputs=gold_outputs,
         )
+        if loss_mask is None:
+            loss_mask = torch.ones_like(gold_outputs, dtype=torch.bool)
+        self.loss_mask = loss_mask
 
     def __getitem__(
         self, idx: Any
@@ -192,6 +199,7 @@ class TransformerInterchangeInterventionDataset(InterchangeInterventionDataset):
         Float[Tensor, "num_samples num_nodes seq_len seq_len"],
         Float[Tensor, "num_samples 1+num_nodes*seq_len total_space_size"],
         Float[Tensor, "num_samples seq_len"],
+        Bool[Tensor, "num_samples seq_len"],
     ]:
         # For the following shapes we assume that idx is 1 dimensional
         if torch.is_tensor(idx):
@@ -209,6 +217,9 @@ class TransformerInterchangeInterventionDataset(InterchangeInterventionDataset):
 
         # (num_samples, seq_len)
         gold_outputs = self.gold_outputs[idx]
+
+        # (num_samples, seq_len)
+        loss_mask = self.loss_mask[idx]
 
         # (num_samples, seq_len, total_space_size)
         base_input_activations = self.activation_values[self.base_input_indices[idx]]
@@ -232,6 +243,7 @@ class TransformerInterchangeInterventionDataset(InterchangeInterventionDataset):
             source_inputs,
             combined_input_activations,
             gold_outputs,
+            loss_mask,
         )
 
 
@@ -678,8 +690,12 @@ class VariableAlignment:
             iterator = tqdm(iterator, desc="Computing gold outputs")
         for batch_start in iterator:
             dag_output = self.run_interchange_intervention(
-                base_inputs[batch_start : batch_start + dag_batch_size].to(self.dag.device),
-                source_inputs[batch_start : batch_start + dag_batch_size].to(self.dag.device),
+                base_inputs[batch_start : batch_start + dag_batch_size].to(
+                    self.dag.device
+                ),
+                source_inputs[batch_start : batch_start + dag_batch_size].to(
+                    self.dag.device
+                ),
                 output_type="output_nodes",
             ).to(dataset_device)
             gold_outputs[batch_start : batch_start + dag_batch_size] = dag_output
@@ -742,6 +758,62 @@ class VariableAlignment:
         agreements = output_low_level.argmax(dim=1) == gold_outputs
 
         return loss, agreements
+
+    def _run_epoch(
+        self,
+        ii_dataloader: DataLoader,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        progress_bar_desc: Optional[str] = None,
+    ) -> tuple[float, float]:
+        """Run an epoch of training or evaluation
+
+        Parameters
+        ----------
+        ii_dataloader : DataLoader
+            The dataloader to use
+        optimizer : torch.optim.Optimizer, optional
+            The optimizer to use for training. If None, we will run evaluation instead
+        progress_bar_desc : str, optional
+            The description to use for the progress bar
+
+        Returns
+        -------
+        loss : float
+            The average loss over the epoch
+        accuracy : float
+            The average accuracy over the epoch
+        """
+        total_loss = 0.0
+        total_agreement = 0.0
+
+        iterator = ii_dataloader
+        if self.progress_bar:
+            iterator = tqdm(
+                iterator,
+                total=len(ii_dataloader),
+                desc=progress_bar_desc,
+            )
+        for batch in iterator:
+            base_input = batch[0].to(self.device)
+            source_inputs = batch[1].to(self.device)
+            combined_activations = batch[2].to(self.device)
+            gold_outputs = batch[3].to(self.device)
+
+            loss, agreements = self.dii_training_objective_and_agreement(
+                base_input=base_input,
+                source_inputs=source_inputs,
+                combined_activations=combined_activations,
+                gold_outputs=gold_outputs,
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_agreement += agreements.float().mean().item()
+
+        return total_loss / len(ii_dataloader), total_agreement / len(ii_dataloader)
 
     def train_rotation_matrix(
         self,
@@ -811,39 +883,9 @@ class VariableAlignment:
         accuracies = np.empty(num_epochs)
 
         for epoch in range(num_epochs):
-            total_loss = 0.0
-            total_agreement = 0.0
-
-            iterator = ii_dataloader
-            if self.progress_bar:
-                iterator = tqdm(
-                    iterator,
-                    total=len(ii_dataloader),
-                    desc=f"Epoch [{epoch+1}/{num_epochs}]",
-                )
-            for batch in iterator:
-                base_input = batch[0].to(self.device)
-                source_inputs = batch[1].to(self.device)
-                combined_activations = batch[2].to(self.device)
-                gold_outputs = batch[3].to(self.device)
-
-                loss, agreements = self.dii_training_objective_and_agreement(
-                    base_input=base_input,
-                    source_inputs=source_inputs,
-                    combined_activations=combined_activations,
-                    gold_outputs=gold_outputs,
-                )
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-                total_agreement += agreements.float().mean().item()
-
-            losses[epoch] = total_loss / len(ii_dataloader)
-            accuracies[epoch] = total_agreement / len(ii_dataloader)
-
+            losses[epoch], accuracies[epoch] = self._run_epoch(
+                ii_dataloader, optimizer, f"Epoch [{epoch+1}/{num_epochs}]"
+            )
             if self.verbosity >= 1:
                 print(f"Loss: {losses[epoch]:0.5f}, Accuracy: {accuracies[epoch]:0.5f}")
 
@@ -902,34 +944,7 @@ class VariableAlignment:
         sampler = BatchSampler(sampler, batch_size=batch_size, drop_last=False)
         ii_dataloader = DataLoader(ii_dataset, sampler=sampler, batch_size=None)
 
-        total_loss = 0.0
-        total_agreement = 0.0
-
-        iterator = ii_dataloader
-        if self.progress_bar:
-            iterator = tqdm(
-                iterator,
-                total=len(ii_dataloader),
-                desc=f"Testing",
-            )
-        for batch in iterator:
-            base_input = batch[0].to(self.device)
-            source_inputs = batch[1].to(self.device)
-            combined_activations = batch[2].to(self.device)
-            gold_outputs = batch[3].to(self.device)
-
-            loss, agreement = self.dii_training_objective_and_agreement(
-                base_input=base_input,
-                source_inputs=source_inputs,
-                combined_activations=combined_activations,
-                gold_outputs=gold_outputs,
-            )
-
-            total_loss += loss.item()
-            total_agreement += agreement.float().mean().item()
-
-        loss = total_loss / len(ii_dataloader)
-        accuracy = total_agreement / len(ii_dataloader)
+        loss, accuracy = self._run_epoch(ii_dataloader, None, "Testing")
 
         return loss, accuracy
 
@@ -1218,6 +1233,7 @@ class TransformerVariableAlignment(VariableAlignment):
         ],
         gold_outputs: Float[Tensor, "batch_size seq_len"],
         loss_fn: callable = F.cross_entropy,
+        loss_mask: Optional[Bool[Tensor, "batch_size seq_len"]] = None,
     ) -> tuple[Float[Tensor, ""], Float[Tensor, "batch_size seq_len"]]:
         """Compute the training objective and accuracy of DII
 
@@ -1239,6 +1255,8 @@ class TransformerVariableAlignment(VariableAlignment):
             The gold outputs
         loss_fn : callable, default=F.cross_entropy
             The loss function to use
+        loss_mask : Bool[Tensor, "batch_size seq_len"], optional
+            A mask to apply before computing the loss. By default, no mask is applied
 
         Returns
         -------
@@ -1249,12 +1267,22 @@ class TransformerVariableAlignment(VariableAlignment):
             interventions
         """
 
+        if loss_mask is None:
+            loss_mask = torch.ones_like(gold_outputs, dtype=torch.bool)
+
+        def masked_loss(input, target, loss_fn, loss_mask):
+            loss_unreduced = loss_fn(input, target, reduction="none")
+            loss_reduced = loss_unreduced[loss_mask].mean()
+            return loss_reduced
+
+        new_loss_fn = partial(masked_loss, loss_fn=loss_fn, loss_mask=loss_mask)
+
         return super().dii_training_objective_and_agreement(
             base_input=base_input,
             source_inputs=source_inputs,
             combined_activations=combined_activations,
             gold_outputs=gold_outputs,
-            loss_fn=loss_fn,
+            loss_fn=new_loss_fn,
         )
 
     def compute_activation_values(
@@ -1339,6 +1367,7 @@ class TransformerVariableAlignment(VariableAlignment):
         batch_size=32,
         dag_batch_size=10000,
         dataset_device: str | torch.device = "cpu",
+        pad_token_id: Optional[int] = None,
     ) -> TransformerInterchangeInterventionDataset:
         """Create a dataset of interchange intervention
 
@@ -1359,6 +1388,9 @@ class TransformerVariableAlignment(VariableAlignment):
             The batch size to use when running interchange intervention on the DAG
         dataset_device : str or torch.device, default="cpu"
             The device to put the dataset on.
+        pad_token_id : int, optional
+            The padding token ID to use. If not provided, use
+            `low_level_model.tokenizer.pad_token_id`
 
         Returns
         -------
@@ -1374,6 +1406,9 @@ class TransformerVariableAlignment(VariableAlignment):
         num_inputs = inputs.shape[0]
         seq_len = inputs.shape[1]
         num_nodes = self.num_nodes
+
+        if pad_token_id is None:
+            pad_token_id = self.low_level_model.tokenizer.pad_token_id
 
         # Make sure the inputs are on the right device
         inputs = inputs.to(dataset_device)
@@ -1421,6 +1456,7 @@ class TransformerVariableAlignment(VariableAlignment):
             (num_samples, seq_len), dtype=torch.long, device=dataset_device
         )
 
+        # Compute the gold outputs in batches
         iterator = range(0, num_samples, dag_batch_size)
         if self.verbosity >= 1 and self.progress_bar:
             iterator = tqdm(iterator, desc="Computing gold outputs")
@@ -1436,13 +1472,80 @@ class TransformerVariableAlignment(VariableAlignment):
             ).to(dataset_device)
             gold_outputs[batch_start : batch_start + dag_batch_size, :] = dag_output
 
+        # (num_samples, seq_len)
+        loss_mask = base_inputs != pad_token_id
+        # loss_mask = loss_mask & einops.reduce(
+        #     source_inputs != pad_token_id,
+        #     "num_samples num_nodes seq_len_1 seq_len_2 -> num_samples seq_len_2",
+        #     reduction="min",
+        # )
+
         return TransformerInterchangeInterventionDataset(
             inputs=inputs,
             activation_values=activation_values,
             base_input_indices=base_input_indices,
             source_input_indices=source_input_indices,
             gold_outputs=gold_outputs,
+            loss_mask=loss_mask,
         )
+
+    def _run_epoch(
+        self,
+        ii_dataloader: DataLoader,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        progress_bar_desc: Optional[str] = None,
+    ) -> tuple[float, float]:
+        """Run an epoch of training or evaluation
+
+        Parameters
+        ----------
+        ii_dataloader : DataLoader
+            The dataloader to use
+        optimizer : torch.optim.Optimizer, optional
+            The optimizer to use for training. If None, we will run evaluation instead
+        progress_bar_desc : str, optional
+            The description to use for the progress bar
+
+        Returns
+        -------
+        loss : float
+            The average loss over the epoch
+        accuracy : float
+            The average accuracy over the epoch
+        """
+        total_loss = 0.0
+        total_agreement = 0.0
+
+        iterator = ii_dataloader
+        if self.progress_bar:
+            iterator = tqdm(
+                iterator,
+                total=len(ii_dataloader),
+                desc=progress_bar_desc,
+            )
+        for batch in iterator:
+            base_input = batch[0].to(self.device)
+            source_inputs = batch[1].to(self.device)
+            combined_activations = batch[2].to(self.device)
+            gold_outputs = batch[3].to(self.device)
+            loss_mask = batch[4].to(self.device)
+
+            loss, agreements = self.dii_training_objective_and_agreement(
+                base_input=base_input,
+                source_inputs=source_inputs,
+                combined_activations=combined_activations,
+                gold_outputs=gold_outputs,
+                loss_mask=loss_mask,
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_agreement += agreements[loss_mask].float().mean().item()
+
+        return total_loss / len(ii_dataloader), total_agreement / len(ii_dataloader)
 
     def train_rotation_matrix(
         self,
