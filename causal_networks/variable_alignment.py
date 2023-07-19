@@ -16,6 +16,8 @@ from torch.utils.data import (
 )
 from torch.nn.utils.parametrizations import orthogonal
 
+import einops
+
 from jaxtyping import Float
 
 import numpy as np
@@ -732,12 +734,7 @@ class VariableAlignment:
         )
 
         # Permute the output so that the class dimension is second
-        permutation = (
-            [0]
-            + [output_low_level.ndim - 1]
-            + list(range(1, output_low_level.ndim - 1))
-        )
-        output_low_level = output_low_level.permute(*permutation)
+        output_low_level = einops.rearrange(output_low_level, "b ... c -> b c ...")
 
         # Compute the loss
         loss = loss_fn(output_low_level, gold_outputs)
