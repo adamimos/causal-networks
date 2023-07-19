@@ -43,9 +43,15 @@ replacing `DOCKER_REPO` and `DOCKER_TAG` with the appropriate details.
 
 ## TODO
 
+- Currently `TransformerVariableAlignment` compares the low-level and DAG outputs on all
+  tokens, including pad tokens. This probably doesn't make any sense, and is messing up
+  training and evaluation.
 - The interchange intervention dataset specifies for each datapoint a subset of the
   nodes which are intervened on. Currently the way this is done is by replacing the
   values of the non-intervened nodes with the values taken on the base input. This works
   fine for nodes which don't lie above or below each other, but otherwise doesn't work.
   It would be good to allow only intervening on the selected nodes, leaving the rest as
   they are. Could be done with a mask on the nodes.
+- When computing the activation values on the source inputs, there's no need to run the
+  model beyond the last layer. It should be easy to stop execution at this point by
+  raising an exception in a hook. This should make precomputing faster.
