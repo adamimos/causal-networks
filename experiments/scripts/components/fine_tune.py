@@ -30,6 +30,7 @@ def fine_tune_paren_bal(
     learning_rate: float = 1e-4,
     num_epochs: int = 10,
     lr_scheduler_patience: int = 1000,
+    optimizer_name: str = "Adam",
     seed: int = 2384,
 ):
     
@@ -158,7 +159,12 @@ def fine_tune_paren_bal(
 
     model.train()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    if optimizer_name == "Adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    elif optimizer_name == "SGD":
+        optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    else:
+        raise ValueError(f"Unknown optimizer name {optimizer_name}")
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, "min", patience=lr_scheduler_patience, verbose=True
     )
