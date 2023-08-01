@@ -57,9 +57,9 @@ cmd_args = parser.parse_args()
 # The different hyperparameters to test
 param_grid = {
     "seed": [2384],
-    "batch_size": [256],
+    "batch_size": [512],
     "learning_rate": [1e-1, 1e-2, 1e-3, 1e-4],
-    "num_epochs": [0],
+    "num_epochs": [50],
     "lr_scheduler_patience": [1000],
 }
 
