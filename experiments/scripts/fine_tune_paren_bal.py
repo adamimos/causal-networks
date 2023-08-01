@@ -58,8 +58,9 @@ cmd_args = parser.parse_args()
 param_grid = {
     "seed": [2384],
     "batch_size": [512],
-    "learning_rate": [1e-1, 1e-2, 1e-3, 1e-4],
+    "learning_rate": [0.3, 0.1, 0.03, 0.01, 0.003, 0.001],
     "num_epochs": [50],
+    "optimizer": ["Adam"],
     "lr_scheduler_patience": [1000],
 }
 
