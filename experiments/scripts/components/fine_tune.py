@@ -33,7 +33,6 @@ def fine_tune_paren_bal(
     optimizer_name: str = "Adam",
     seed: int = 2384,
 ):
-    
     #####################
     # Set the random seed
     #####################
@@ -200,7 +199,10 @@ def fine_tune_paren_bal(
             total_loss += loss.item()
             with torch.no_grad():
                 total_agreement += (
-                    (torch.argmax(output, dim=-1) == gold_output).float().mean().item()
+                    (torch.argmax(output, dim=-1) == gold_output)[loss_mask]
+                    .float()
+                    .mean()
+                    .item()
                 )
 
         losses[epoch] = total_loss / len(train_dataloader)
@@ -230,7 +232,10 @@ def fine_tune_paren_bal(
             loss_mask = loss_mask.to(device)
             output = model(tokens)
             total_agreement += (
-                (torch.argmax(output, dim=-1) == gold_output).float().mean().item()
+                (torch.argmax(output, dim=-1) == gold_output)[loss_mask]
+                .float()
+                .mean()
+                .item()
             )
     val_accuracy = total_agreement / len(validation_dataloader)
 
