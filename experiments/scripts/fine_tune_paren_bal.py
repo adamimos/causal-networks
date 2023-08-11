@@ -15,6 +15,7 @@ SCRIPT_PATH = os.path.realpath(__file__)
 PROJECT_DIR = os.path.normpath(SCRIPT_PATH + "/../../..")
 DATASET_DIR = os.path.join(PROJECT_DIR, "data")
 EXPERIMENT_RESULTS_DIR = os.path.join(PROJECT_DIR, "experiments", "results")
+SAVED_MODELS_DIR = os.path.join(PROJECT_DIR, "models", "paren-balancing")
 TEXT_DATASET_NAME = "single_line.csv"
 TEXT_DATASET_FILE = os.path.join(DATASET_DIR, "paren-balancing", TEXT_DATASET_NAME)
 
@@ -48,6 +49,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--gpu-num", type=int, default=0, help="The (0-indexed) GPU number to use"
+)
+parser.add_argument(
+    "--final-model",
+    action="store_true",
+    help="Test on test data split and save the model",
 )
 
 # Get the arguments
@@ -103,9 +109,10 @@ try:
         print()
         print()
 
-        results = fine_tune_paren_bal(
+        results, model = fine_tune_paren_bal(
             base_model_name=BASE_MODEL_NAME,
             text_dataset_file=TEXT_DATASET_FILE,
+            final_model=cmd_args.final_model,
             device=device,
             batch_size=combo["batch_size"],
             learning_rate=combo["learning_rate"],
@@ -127,6 +134,10 @@ try:
             "w",
         ) as f:
             json.dump(results, f)
+
+        if cmd_args.final_model:
+            print("Saving model...")
+            torch.save(os.path.join(SAVED_MODELS_DIR, f"{run_id}.pt"))
 
         run_results[i] = "SUCCEEDED"
 

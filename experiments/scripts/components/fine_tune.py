@@ -21,6 +21,7 @@ from transformer_lens import HookedTransformer
 def fine_tune_paren_bal(
     base_model_name: str,
     text_dataset_file: str,
+    final_model: bool = False,
     device: torch.device | str = "cuda",
     open_paren_str_tokens: list = ["("],
     close_paren_str_tokens: list = [")"],
@@ -32,7 +33,7 @@ def fine_tune_paren_bal(
     lr_scheduler_patience: int = 1000,
     optimizer_name: str = "Adam",
     seed: int = 2384,
-):
+) -> tuple[dict[str, np.ndarray], HookedTransformer]:
     #####################
     # Set the random seed
     #####################
@@ -220,10 +221,15 @@ def fine_tune_paren_bal(
 
     total_agreement = 0.0
 
+    if final_model:
+        dataloader = test_dataloader
+    else:
+        dataloader = validation_dataloader
+
     iterator = tqdm(
-        validation_dataloader,
-        total=len(validation_dataloader),
-        desc=f"Eval",
+        dataloader,
+        total=len(dataloader),
+        desc="Evaluating model"
     )
     with torch.no_grad():
         for tokens, gold_output, loss_mask in iterator:
@@ -237,9 +243,12 @@ def fine_tune_paren_bal(
                 .mean()
                 .item()
             )
-    val_accuracy = total_agreement / len(validation_dataloader)
+    test_accuracy = total_agreement / len(validation_dataloader)
 
-    print(f"Eval accuracy: {val_accuracy:.4f}")
+    if final_model:
+        print(f"Test accuracy: {test_accuracy:.4f}")
+    else:
+        print(f"Validation accuracy: {test_accuracy:.4f}")
 
     #####################
     # Return the results
@@ -248,7 +257,10 @@ def fine_tune_paren_bal(
     results = {
         "train_losses": losses,
         "train_accuracies": accuracies,
-        "val_accuracy": val_accuracy,
     }
+    if final_model:
+        results["test_accuracy"] = test_accuracy
+    else:
+        results["val_accuracy"] = test_accuracy
 
-    return results
+    return results, model
