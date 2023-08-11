@@ -64,7 +64,7 @@ cmd_args = parser.parse_args()
 param_grid = {
     "seed": [2384],
     "batch_size": [512],
-    "learning_rate": [0.3, 0.1, 0.03, 0.01, 0.003, 0.001],
+    "learning_rate": [0.01],
     "num_epochs": [50],
     "optimizer": ["Adam"],
     "lr_scheduler_patience": [1000],
@@ -137,7 +137,7 @@ try:
 
         if cmd_args.final_model:
             print("Saving model...")
-            torch.save(os.path.join(SAVED_MODELS_DIR, f"{run_id}.pt"))
+            torch.save(model, os.path.join(SAVED_MODELS_DIR, f"{run_id}.pt"))
 
         run_results[i] = "SUCCEEDED"
 
